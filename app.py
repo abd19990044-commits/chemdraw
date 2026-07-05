@@ -616,25 +616,54 @@ async def get_solubility_async(cid: int) -> str:
     return '  🔹 (Not available)'
 
 
+class PubChemUnavailableError(Exception):
+    """يُرفع عندما يفشل الاتصال بـ PubChem لسبب غير "المركّب غير موجود" الحقيقي
+    (حظر مؤقت للـ IP، صفحة HTML بدل JSON، خطأ خادم 5xx، ...). نفرّق بينه وبين
+    "غير موجود" الحقيقية (404 أو نتيجة فارغة) حتى لا نعرض على المستخدم رسالة
+    مضلِّلة توحي بأن اسم المركّب خاطئ بينما المشكلة فعلياً من جهة الخادم/الشبكة."""
+
+
 async def _fetch_pubchem_compound_payload(name: str) -> dict[str, Any] | None:
     client = await get_http_client()
     encoded = urllib.parse.quote(name)
     url = f'https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/{encoded}/property/CanonicalSMILES,IUPACName,MolecularFormula,MolecularWeight,Title/JSON'
     resp = await client.get(url)
+
+    if resp.status_code == 404:
+        # هذه هي حالة "غير موجود" الحقيقية الوحيدة: PubChem تعرف الطلب ورَدّت
+        # بصراحة أنه لا يوجد مركّب بهذا الاسم.
+        return None
+
     if resp.status_code != 200:
-        return None
-    # إصلاح: قد يردّ PubChem أحياناً بحالة 200 مع جسم فارغ أو غير JSON صالح
-    # (خصوصاً تحت الضغط أو لأسماء غامضة)، مما كان يرمي JSONDecodeError غير
-    # محمي هنا ("Expecting value: line 1 column 1 (char 0)") ويظهر للمستخدم
-    # كخطأ عام غير مفهوم بدل رسالة واضحة عن فشل جلب البيانات.
+        # إصلاح: أي حالة غير 200/404 (403 حظر، 503 تحميل زائد، 400 طلب غير
+        # صالح، ...) كانت تُعامَل سابقاً كـ "غير موجود" أيضاً، فيظهر للمستخدم
+        # خطأ مضلِّل يوحي بأن اسم المركّب خاطئ بينما السبب الحقيقي هو فشل من
+        # جهة الخادم/الشبكة (شائع مع مزوّدي الاستضافة المجانية مثل Render حيث
+        # قد تحظر PubChem أو تقيّد الـ IP المشترك). نسجّل التفاصيل ونرفع خطأ
+        # مخصصاً يُترجَم لاحقاً إلى رسالة واضحة للمستخدم بدل "not found".
+        orca_logger.warning(
+            f'PubChem non-200/404 status for "{name}": {resp.status_code} — body[:200]={resp.text[:200]!r}'
+        )
+        raise PubChemUnavailableError(f'HTTP {resp.status_code}')
+
     if not resp.text.strip():
-        orca_logger.warning(f'PubChem returned an empty body for compound name lookup: {name}')
-        return None
+        # إصلاح: قد يردّ PubChem أحياناً بحالة 200 مع جسم فارغ (شائع أيضاً عند
+        # حظر/تقييد مؤقت من جهتهم)، مما كان يرمي JSONDecodeError غير محمي هنا
+        # ("Expecting value: line 1 column 1 (char 0)") ويظهر للمستخدم كخطأ
+        # عام غير مفهوم بدل رسالة واضحة عن فشل الخدمة.
+        orca_logger.warning(f'PubChem returned an empty body (status 200) for compound name lookup: {name}')
+        raise PubChemUnavailableError('empty body with status 200')
+
     try:
         data = resp.json()
     except ValueError as e:
-        orca_logger.error(f'PubChem returned invalid JSON for "{name}": {e}')
-        return None
+        # مثال شائع: PubChem يردّ بصفحة HTML (تحدي حماية/حظر) بدل JSON رغم
+        # حالة 200. نسجّل مقتطفاً من الجسم الفعلي ليسهل تشخيصه من سجلات Render.
+        orca_logger.error(
+            f'PubChem returned invalid JSON for "{name}": {e} — body[:200]={resp.text[:200]!r}'
+        )
+        raise PubChemUnavailableError('invalid JSON body') from e
+
     props = data.get('PropertyTable', {}).get('Properties', [])
     if not props:
         return None
@@ -706,7 +735,26 @@ async def fetch_compound_async(name: str) -> tuple:
         return cached
 
     try:
-        payload = await _fetch_pubchem_compound_payload(name)
+        # إصلاح: كانت أي مشكلة اتصال/حظر مؤقت من PubChem تُعرَض للمستخدم فوراً
+        # كـ "not found"، مما يوحي خطأً بأن اسم المركّب غير صحيح. الآن نميّز
+        # هذه الحالة (PubChemUnavailableError) ونعيد المحاولة مرة واحدة بعد
+        # تأخير قصير (حظر PubChem المؤقت لبعض عناوين IP المشتركة على استضافات
+        # مثل Render غالباً ما يزول خلال ثوانٍ)، قبل الاستسلام برسالة واضحة.
+        try:
+            payload = await _fetch_pubchem_compound_payload(name)
+        except PubChemUnavailableError:
+            orca_logger.info(f'Retrying PubChem lookup for "{name}" after transient failure...')
+            await asyncio.sleep(1.5)
+            try:
+                payload = await _fetch_pubchem_compound_payload(name)
+            except PubChemUnavailableError as e2:
+                return (
+                    None, None, None,
+                    'PubChem service is temporarily unavailable or blocking this server\'s '
+                    f'requests ({e2}). This is usually not an issue with the compound name — '
+                    'please try again in a minute.',
+                )
+
         if not payload:
             return (None, None, None, f"Compound '{name}' not found in PubChem.")
 
