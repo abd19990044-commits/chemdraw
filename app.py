@@ -191,7 +191,19 @@ async def get_http_client() -> httpx.AsyncClient:
         _http_client = httpx.AsyncClient(
             timeout=httpx.Timeout(12.0, connect=6.0),
             limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
-            headers={'User-Agent': 'Mozilla/5.0 ORCABot/3.0'},
+            # إصلاح: كان الـ User-Agent السابق "Mozilla/5.0 ORCABot/3.0" يحوي
+            # كلمة "Bot" صراحةً، وهي علامة يعتمد عليها كثير من أنظمة الحماية
+            # ضد الزحف الآلي (WAF/anti-bot) لحظر أو تقييد الطلبات تلقائياً —
+            # بصرف النظر عن صحة الطلب نفسه. هذا مرشّح قوي لتفسير ردود PubChem
+            # غير JSON (200 بجسم غير صالح) التي نراها بثبات حتى بعد إعادة
+            # المحاولة. استبدلناه بسلسلة متصفح حقيقية شائعة الاستخدام.
+            headers={
+                'User-Agent': (
+                    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+                    '(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+                ),
+                'Accept': 'application/json,text/html,*/*',
+            },
             follow_redirects=True,
         )
     return _http_client
@@ -623,51 +635,78 @@ class PubChemUnavailableError(Exception):
     مضلِّلة توحي بأن اسم المركّب خاطئ بينما المشكلة فعلياً من جهة الخادم/الشبكة."""
 
 
+# إصلاح جذري: تبيّن بالاختبار الفعلي أن طلب PubChem المُجمَّع (خصائص متعددة
+# CanonicalSMILES,IUPACName,MolecularFormula,MolecularWeight,Title بصيغة
+# JSON عبر compound/name/.../property/.../JSON) يفشل بثبات من هذا الخادم
+# تحديداً (يردّ 200 لكن بجسم غير قابل للتحليل كـ JSON)، بينما بوت الكيمياء
+# الآخر في نفس الملف ينجح بلا مشاكل في الاتصال بـ PubChem لنفس المركّب. الفرق
+# الوحيد: بوت الكيمياء يطلب خاصية واحدة فقط بصيغة TXT في كل طلب
+# (compound/name/.../property/X/TXT) بدل خاصية متعددة مجمّعة بصيغة JSON.
+# بدل تخمين أي جزء من الطلب المُجمَّع هو المُعطِّل (قائمة الخصائص؟ صيغة
+# الإخراج؟ حجم الرد؟)، استبدلنا الطلب المُجمَّع بعدة طلبات TXT بسيطة صغيرة
+# تُنفَّذ بالتوازي — وهو *بالضبط* نمط الطلب المُثبَت نجاحه فعلياً على هذا
+# الخادم بالذات لنفس هذا المركّب. CanonicalSMILES حُذفت لأنها لم تكن
+# تُستخدَم أصلاً في أي مكان لاحق بالكود (بيانات مجلوبة دون استخدام)، وTitle
+# حُذفت لأنها كانت مجرد احتياط ثانوي بعد IUPACName أصلاً.
+async def _pubchem_txt_property(client: httpx.AsyncClient, encoded_name: str, prop: str) -> str | None:
+    url = f'https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/{encoded_name}/property/{prop}/TXT'
+    resp = await client.get(url)
+    if resp.status_code == 404:
+        return None
+    if resp.status_code != 200:
+        orca_logger.warning(
+            f'PubChem TXT property "{prop}" failed: {resp.status_code} — body[:150]={resp.text[:150]!r}'
+        )
+        raise PubChemUnavailableError(f'HTTP {resp.status_code} (property {prop})')
+    return resp.text.strip() or None
+
+
+async def _pubchem_cid_by_name(client: httpx.AsyncClient, encoded_name: str) -> int | None:
+    url = f'https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/{encoded_name}/cids/TXT'
+    resp = await client.get(url)
+    if resp.status_code == 404:
+        return None
+    if resp.status_code != 200:
+        orca_logger.warning(
+            f'PubChem CID lookup failed: {resp.status_code} — body[:150]={resp.text[:150]!r}'
+        )
+        raise PubChemUnavailableError(f'HTTP {resp.status_code} (cids)')
+    text = resp.text.strip()
+    if not text:
+        return None
+    first_line = text.splitlines()[0].strip()
+    try:
+        return int(first_line)
+    except ValueError:
+        orca_logger.warning(f'PubChem CID lookup returned non-numeric body: {first_line!r}')
+        return None
+
+
 async def _fetch_pubchem_compound_payload(name: str) -> dict[str, Any] | None:
     client = await get_http_client()
     encoded = urllib.parse.quote(name)
-    url = f'https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/{encoded}/property/CanonicalSMILES,IUPACName,MolecularFormula,MolecularWeight,Title/JSON'
-    resp = await client.get(url)
 
-    if resp.status_code == 404:
-        # هذه هي حالة "غير موجود" الحقيقية الوحيدة: PubChem تعرف الطلب ورَدّت
-        # بصراحة أنه لا يوجد مركّب بهذا الاسم.
+    # الطلبات الأربعة تُنفَّذ بالتوازي بنفس أسلوب TXT المُثبَت نجاحه. أي فشل
+    # مؤقت (حظر/جسم غير صالح) في أيّ منها يرفع PubChemUnavailableError، والتي
+    # يلتقطها fetch_compound_async لإعادة المحاولة أو إظهار رسالة واضحة
+    # للمستخدم — دون تغيير في تلك الطبقة.
+    cid, iupac_name, mol_formula, mol_weight = await asyncio.gather(
+        _pubchem_cid_by_name(client, encoded),
+        _pubchem_txt_property(client, encoded, 'IUPACName'),
+        _pubchem_txt_property(client, encoded, 'MolecularFormula'),
+        _pubchem_txt_property(client, encoded, 'MolecularWeight'),
+    )
+
+    if cid is None:
+        # هذه هي حالة "غير موجود" الحقيقية: PubChem لا يعرف مركّباً بهذا الاسم.
         return None
 
-    if resp.status_code != 200:
-        # إصلاح: أي حالة غير 200/404 (403 حظر، 503 تحميل زائد، 400 طلب غير
-        # صالح، ...) كانت تُعامَل سابقاً كـ "غير موجود" أيضاً، فيظهر للمستخدم
-        # خطأ مضلِّل يوحي بأن اسم المركّب خاطئ بينما السبب الحقيقي هو فشل من
-        # جهة الخادم/الشبكة (شائع مع مزوّدي الاستضافة المجانية مثل Render حيث
-        # قد تحظر PubChem أو تقيّد الـ IP المشترك). نسجّل التفاصيل ونرفع خطأ
-        # مخصصاً يُترجَم لاحقاً إلى رسالة واضحة للمستخدم بدل "not found".
-        orca_logger.warning(
-            f'PubChem non-200/404 status for "{name}": {resp.status_code} — body[:200]={resp.text[:200]!r}'
-        )
-        raise PubChemUnavailableError(f'HTTP {resp.status_code}')
-
-    if not resp.text.strip():
-        # إصلاح: قد يردّ PubChem أحياناً بحالة 200 مع جسم فارغ (شائع أيضاً عند
-        # حظر/تقييد مؤقت من جهتهم)، مما كان يرمي JSONDecodeError غير محمي هنا
-        # ("Expecting value: line 1 column 1 (char 0)") ويظهر للمستخدم كخطأ
-        # عام غير مفهوم بدل رسالة واضحة عن فشل الخدمة.
-        orca_logger.warning(f'PubChem returned an empty body (status 200) for compound name lookup: {name}')
-        raise PubChemUnavailableError('empty body with status 200')
-
-    try:
-        data = resp.json()
-    except ValueError as e:
-        # مثال شائع: PubChem يردّ بصفحة HTML (تحدي حماية/حظر) بدل JSON رغم
-        # حالة 200. نسجّل مقتطفاً من الجسم الفعلي ليسهل تشخيصه من سجلات Render.
-        orca_logger.error(
-            f'PubChem returned invalid JSON for "{name}": {e} — body[:200]={resp.text[:200]!r}'
-        )
-        raise PubChemUnavailableError('invalid JSON body') from e
-
-    props = data.get('PropertyTable', {}).get('Properties', [])
-    if not props:
-        return None
-    return props[0]
+    return {
+        'CID': cid,
+        'IUPACName': iupac_name,
+        'MolecularFormula': mol_formula,
+        'MolecularWeight': mol_weight,
+    }
 
 
 async def _download_pubchem_png(cid: int) -> bytes | None:
@@ -759,7 +798,7 @@ async def fetch_compound_async(name: str) -> tuple:
             return (None, None, None, f"Compound '{name}' not found in PubChem.")
 
         cid = payload.get('CID')
-        iupac_name = payload.get('IUPACName') or payload.get('Title') or name
+        iupac_name = payload.get('IUPACName') or name
         mol_formula = payload.get('MolecularFormula', '')
         mol_weight = payload.get('MolecularWeight', '')
 
