@@ -623,7 +623,18 @@ async def _fetch_pubchem_compound_payload(name: str) -> dict[str, Any] | None:
     resp = await client.get(url)
     if resp.status_code != 200:
         return None
-    data = resp.json()
+    # إصلاح: قد يردّ PubChem أحياناً بحالة 200 مع جسم فارغ أو غير JSON صالح
+    # (خصوصاً تحت الضغط أو لأسماء غامضة)، مما كان يرمي JSONDecodeError غير
+    # محمي هنا ("Expecting value: line 1 column 1 (char 0)") ويظهر للمستخدم
+    # كخطأ عام غير مفهوم بدل رسالة واضحة عن فشل جلب البيانات.
+    if not resp.text.strip():
+        orca_logger.warning(f'PubChem returned an empty body for compound name lookup: {name}')
+        return None
+    try:
+        data = resp.json()
+    except ValueError as e:
+        orca_logger.error(f'PubChem returned invalid JSON for "{name}": {e}')
+        return None
     props = data.get('PropertyTable', {}).get('Properties', [])
     if not props:
         return None
