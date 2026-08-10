@@ -2020,10 +2020,11 @@ def generate_rxn_file(reactant_pairs, product_pairs, filename: str, title: str =
 
     def expand(pairs):
         out = []
-        for coefficient, smiles in pairs:
-            n = Fraction(coefficient)
+        for term in pairs:
+            n = Fraction(term.coefficient)
             if n.denominator != 1 or n <= 0:
                 return None
+            smiles = term.name
             out.extend([smiles] * int(n))
         return out
 
@@ -2218,7 +2219,15 @@ async def _handle_reaction(update: Update, status_msg, text: str) -> None:
 
     scheme_bytes, rxn_file = await asyncio.gather(
         asyncio.to_thread(render_reaction_scheme, reactant_pairs, product_pairs),
-        asyncio.to_thread(generate_rxn_file, reactant_pairs, product_pairs, "Reaction.rxn", rxn_title),
+        # generate_rxn_file expects ReactionTerm objects so it can preserve
+        # and exactly scale stoichiometric coefficients (including fractions).
+        asyncio.to_thread(
+            generate_rxn_file,
+            [ReactionTerm(coef, smiles) for coef, smiles in reactant_pairs],
+            [ReactionTerm(coef, smiles) for coef, smiles in product_pairs],
+            "Reaction.rxn",
+            rxn_title,
+        ),
     )
 
     caption_lines = ["Reaction scheme:", f"<code>{html.escape(equation)}</code>"]
