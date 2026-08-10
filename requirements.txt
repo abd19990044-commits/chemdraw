@@ -2,3 +2,4 @@ Flask
 httpx
 python-telegram-bot
 rdkit
+Pillow
