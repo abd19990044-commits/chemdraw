@@ -54,6 +54,7 @@ import logging
 import os
 import re
 import threading
+from fractions import Fraction
 import urllib.parse
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -1393,14 +1394,12 @@ def run_orca_flask_server():
 # ══════════════════════════════════════════════════════════════════════════
 # ██  القسم الثاني: بوت الكيمياء - Chemistry Drawing Bot (Polling)  ██
 # ══════════════════════════════════════════════════════════════════════════
+#
+# هذا القسم يستخدم محرك الرسم الكيميائي المدمج من chem_core.py.
+# لا توجد حاجة لملف chem_core.py منفصل: منطق parsing، الرسم، الموازنة،
+# وإنشاء/فحص ملفات RXN موجود هنا داخل app.py، بينما بقي PubChem async
+# كما كان في النسخة الأصلية حتى لا نغيّر معمارية Render/Telegram.
 
-# ============================================================================
-# 1. Configuration & logging
-# ============================================================================
-# ملاحظة دمج: لا حاجة لخادم Flask/PORT منفصل لهذا البوت بعد الدمج، لأن بوت
-# ORCA (في القسم الآخر من هذا الملف) يفتح المنفذ المطلوب من Render عبر
-# Flask + Webhook. بوت الكيمياء يعمل بطريقة polling في Thread خلفي منفصل،
-# وهذا لا يحتاج فتح أي منفذ إطلاقاً.
 CHEM_BOT_TOKEN: Optional[str] = os.environ.get("CHEM_BOT_TOKEN")
 ADMIN_ID: int = int(os.environ.get("ADMIN_ID", "7495822836"))
 
@@ -1409,8 +1408,8 @@ PUBCHEM_TIMEOUT_SECONDS = 10.0
 PUBCHEM_MAX_CONCURRENT_REQUESTS = 4
 PUBCHEM_CACHE_MAX_ENTRIES = 512
 
-MOL_IMAGE_SIZE = (420, 420)
-REACTION_SUBIMAGE_SIZE = (350, 350)
+MOL_IMAGE_SIZE = (560, 420)
+REACTION_SUBIMAGE_SIZE = (420, 340)
 DRAWING_BOND_LINE_WIDTH = 2
 DRAWING_FONT_SCALE = 0.85
 
@@ -1419,16 +1418,12 @@ chem_logger = logging.getLogger("chem_bot")
 
 
 # ============================================================================
-# 3. Input parsing: split compound lists, strip coefficients, detect kind
+# 1. Reaction/input parsing — integrated from chem_core.py
 # ============================================================================
-# A leading integer coefficient only counts if separated from the name by
-# whitespace ("2 Water" -> "Water"). A digit glued to the name itself
-# ("5-Bromo Naproxen") is left untouched, unlike a naive `\d+\s*` regex
-# would do.
-_COEFFICIENT_RE = re.compile(r"^\s*(?:\d+\s+)?(.+?)\s*$")
-
-_SMILES_CHAR_RE = re.compile(r"^[A-Za-z0-9@+\-\[\]()=#$/\\%.:*]+$")
-_SMILES_BOND_HINT_RE = re.compile(r"[=#@\[\]/\\%]")
+_COEFFICIENT_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s+(.+)$")
+_BARE_FORMULA_RE = re.compile(r"^(?:\([A-Za-z0-9]+\)\d*|[A-Z][a-z]?\d*)+$")
+_SMILES_CHAR_RE = re.compile(r"^[A-Za-z0-9@+\-\[\]\(\)=#$:/\\%.]+$")
+_SMILES_BOND_HINT_RE = re.compile(r"[=#@\[\]\(\)]")
 
 
 class InputKind(Enum):
@@ -1443,32 +1438,80 @@ class ParsedCompound:
     kind: InputKind
 
 
-def split_compound_list(compounds_str: str) -> List[str]:
-    """Split a '+'-joined list into cleaned tokens, stripping coefficients."""
-    tokens: List[str] = []
-    for part in compounds_str.split("+"):
-        part = re.sub(r"\s+", " ", part).strip()
-        if not part:
-            continue
-        match = _COEFFICIENT_RE.match(part)
-        name = match.group(1).strip() if match else part
+@dataclass(frozen=True)
+class ReactionTerm:
+    coefficient: Fraction
+    name: str
+
+    @property
+    def pretty_coefficient(self) -> str:
+        if self.coefficient == 1:
+            return ""
+        if self.coefficient.denominator == 1:
+            return str(self.coefficient.numerator)
+        return f"{self.coefficient.numerator}/{self.coefficient.denominator}"
+
+
+def parse_coefficient(text: str) -> tuple[Fraction, str]:
+    """Parse 2 H2O, 2H2O, 0.5 O2 and 1/2 O2 without corrupting names."""
+    raw = re.sub(r"\s+", " ", text or "").strip()
+    if not raw:
+        return Fraction(1), ""
+
+    m = re.match(r"^(\d+)\s*/\s*(\d+)\s+(.+)$", raw)
+    if m and int(m.group(2)) != 0:
+        return Fraction(int(m.group(1)), int(m.group(2))), m.group(3).strip()
+
+    m = re.match(r"^(\d+(?:\.\d+)?)\s+(.+)$", raw)
+    if m:
+        return Fraction(m.group(1)), m.group(2).strip()
+
+    m = re.match(r"^(\d+)([A-Z(].*)$", raw)
+    if m and _BARE_FORMULA_RE.match(m.group(2)):
+        return Fraction(int(m.group(1))), m.group(2).strip()
+
+    return Fraction(1), raw
+
+
+def split_compound_terms(compounds_str: str) -> list[ReactionTerm]:
+    """Split a '+'-joined side while preserving stoichiometric coefficients."""
+    terms: list[ReactionTerm] = []
+    for part in (compounds_str or "").split("+"):
+        coefficient, name = parse_coefficient(part)
         if name:
-            tokens.append(name)
-    return tokens
+            terms.append(ReactionTerm(coefficient, name))
+    return terms
+
+
+def split_compound_list(compounds_str: str) -> List[str]:
+    """Backward-compatible helper: return only compound names."""
+    return [term.name for term in split_compound_terms(compounds_str)]
+
+
+def format_equation(reactant_terms: list[ReactionTerm], product_terms: list[ReactionTerm]) -> str:
+    def side(terms):
+        return " + ".join((f"{t.pretty_coefficient} {t.name}").strip() for t in terms)
+    return f"{side(reactant_terms)} -> {side(product_terms)}"
+
+
+def scale_terms_to_integers(*sides: list[ReactionTerm]) -> tuple[int, list[list[ReactionTerm]]]:
+    """Scale fractional stoichiometry to integers for MDL RXN representation."""
+    denominators = [t.coefficient.denominator for side in sides for t in side] or [1]
+    factor = 1
+    for d in denominators:
+        factor = factor * d // __import__('math').gcd(factor, d)
+    scaled = [[ReactionTerm(t.coefficient * factor, t.name) for t in side] for side in sides]
+    return factor, scaled
 
 
 def detect_input_kind(token: str) -> InputKind:
-    """Guess whether `token` is a compound name, a SMILES, or an InChI string."""
     stripped = token.strip()
-
     if stripped.upper().startswith("INCHI="):
         return InputKind.INCHI
-
     if " " not in stripped and _SMILES_CHAR_RE.match(stripped):
         has_digit = any(ch.isdigit() for ch in stripped)
         if _SMILES_BOND_HINT_RE.search(stripped) or has_digit:
             return InputKind.SMILES
-
     return InputKind.NAME
 
 
@@ -1477,15 +1520,14 @@ def parse_compound(token: str) -> ParsedCompound:
 
 
 def safe_filename(name: str) -> str:
-    return "".join(ch if ch.isalnum() else "_" for ch in name).strip("_") or "compound"
+    cleaned = "".join(ch if ch.isalnum() else "_" for ch in name).strip("_")
+    return cleaned[:60] or "molecule"
 
 
 # ============================================================================
-# 4. PubChem client: async, connection-pooled, concurrency-capped, cached
+# 2. PubChem client — original async client retained
 # ============================================================================
 class _LRUCache:
-    """Minimal in-memory LRU cache — no disk, no DB, dies on restart."""
-
     def __init__(self, max_entries: int) -> None:
         self._max_entries = max_entries
         self._data: "OrderedDict[str, Optional[str]]" = OrderedDict()
@@ -1504,8 +1546,6 @@ class _LRUCache:
 
 
 class PubChemClient:
-    """Resolves compound names / InChI strings to canonical SMILES via PubChem."""
-
     def __init__(self) -> None:
         self._client: Optional[httpx.AsyncClient] = None
         self._semaphore = asyncio.Semaphore(PUBCHEM_MAX_CONCURRENT_REQUESTS)
@@ -1515,7 +1555,7 @@ class PubChemClient:
         if self._client is None:
             self._client = httpx.AsyncClient(
                 timeout=PUBCHEM_TIMEOUT_SECONDS,
-                headers={"User-Agent": "ChemistryTelegramBot/2.0"},
+                headers={"User-Agent": "ChemistryTelegramBot/2.1"},
             )
 
     async def close(self) -> None:
@@ -1534,13 +1574,10 @@ class PubChemClient:
         cached = self._cache.get(cache_key)
         if cached is not None:
             return cached
-
         if self._client is None:
             await self.start()
-
         encoded = urllib.parse.quote(value.strip(), safe="")
         url = f"{PUBCHEM_BASE_URL}/compound/{namespace}/{encoded}/property/CanonicalSMILES/TXT"
-
         async with self._semaphore:
             try:
                 assert self._client is not None
@@ -1553,7 +1590,6 @@ class PubChemClient:
                 chem_logger.info("PubChem could not resolve '%s' (%s): %s", value, namespace, exc.response.status_code)
             except (httpx.HTTPError, IndexError) as exc:
                 chem_logger.warning("PubChem request failed for '%s' (%s): %s", value, namespace, exc)
-
         self._cache.set(cache_key, None)
         return None
 
@@ -1561,98 +1597,311 @@ class PubChemClient:
 pubchem_client = PubChemClient()
 
 
-async def resolve_compound_to_smiles(token: str) -> Optional[str]:
-    """Resolve a raw user token (name / SMILES / InChI) to canonical SMILES."""
-    parsed = parse_compound(token)
+# ============================================================================
+# 3. Local formula/ambiguity handling — integrated from chem_core.py
+# ============================================================================
+AMBIGUOUS_TOKENS = {
+    "CO": "carbon monoxide", "NO": "nitric oxide", "CS": "carbon monosulfide",
+    "NC": "cyanide", "OS": "osmium", "SN": "tin", "PS": "phosphorus sulfide",
+    "CN": "cyanide", "NS": "nitrogen sulfide", "SO": "sulfur monoxide",
+    "BN": "boron nitride", "SI": "silicon", "NI": "nickel", "SC": "scandium",
+}
 
+_CONVENTIONAL_FORMULAS = {
+    "O=O": "O2", "[H][H]": "H2", "N#N": "N2", "ClCl": "Cl2", "BrBr": "Br2",
+    "II": "I2", "FF": "F2", "[O][O]": "O2", "O=[O+][O-]": "O3",
+    "O=C=O": "CO2", "[C-]#[O+]": "CO", "O=S=O": "SO2", "O=S(=O)=O": "SO3",
+    "[N]=O": "NO", "[O-][N+]=O": "NO2", "[N-]=[N+]=O": "N2O",
+    "O": "H2O", "OO": "H2O2", "N": "NH3", "S": "H2S", "C": "CH4",
+    "Cl": "HCl", "Br": "HBr", "I": "HI", "F": "HF", "P": "PH3", "[SiH4]": "SiH4",
+    "OS(=O)(=O)O": "H2SO4", "O[N+](=O)[O-]": "HNO3", "OP(=O)(O)O": "H3PO4",
+    "OC(=O)O": "H2CO3", "OS(=O)O": "H2SO3", "N#C": "HCN",
+    "[OH-]": "OH-", "[H+]": "H+", "[NH4+]": "NH4+",
+    "[Na+].[Cl-]": "NaCl", "[Na+].[OH-]": "NaOH", "[K+].[OH-]": "KOH",
+    "[Ca+2].[O-2]": "CaO", "[Na+].[Na+].[O-]C([O-])=O": "Na2CO3",
+    "ClC(Cl)Cl": "CHCl3", "ClC(Cl)(Cl)Cl": "CCl4",
+}
+
+
+def _formula_lookup_table():
+    table = {}
+    for smiles, formula in _CONVENTIONAL_FORMULAS.items():
+        mol = Chem.MolFromSmiles(smiles)
+        if mol is not None:
+            table.setdefault(formula.upper(), Chem.MolToSmiles(mol))
+    for alias, formula in (("H2O2", "H2O2"), ("HOH", "H2O"), ("NH3", "NH3"),
+                           ("CH3OH", "CH4O"), ("HO-", "OH-"), ("OH", "OH-"),
+                           ("NAOH", "NAOH"), ("NACL", "NACL")):
+        if formula.upper() in table:
+            table.setdefault(alias.upper(), table[formula.upper()])
+    return table
+
+
+_SMILES_BY_COMMON_FORMULA = _formula_lookup_table()
+
+
+def smiles_from_common_formula(token: str) -> str | None:
+    return _SMILES_BY_COMMON_FORMULA.get((token or "").strip().upper())
+
+
+async def resolve_species(token: str) -> tuple[str | None, str]:
+    raw = (token or "").strip()
+    if not raw:
+        return None, ""
+
+    if raw.upper() in AMBIGUOUS_TOKENS and raw == raw.upper():
+        meaning = AMBIGUOUS_TOKENS[raw.upper()]
+        smiles = await pubchem_client.get_canonical_smiles_by_name(meaning)
+        if smiles:
+            return smiles, (
+                f"'{raw}' was read as the formula for {meaning}. "
+                f"Write it as SMILES if you meant a different structure."
+            )
+
+    formula_smiles = smiles_from_common_formula(raw)
+    if formula_smiles:
+        return formula_smiles, ""
+
+    parsed = parse_compound(raw)
     if parsed.kind is InputKind.SMILES:
         mol = Chem.MolFromSmiles(parsed.raw)
         if mol is not None:
-            return Chem.MolToSmiles(mol)
-        chem_logger.info("Token looked like SMILES but failed to parse, falling back to name lookup: %s", token)
-        return await pubchem_client.get_canonical_smiles_by_name(parsed.raw)
+            return Chem.MolToSmiles(mol), ""
+        smiles = await pubchem_client.get_canonical_smiles_by_name(parsed.raw)
+        return smiles, ""
 
     if parsed.kind is InputKind.INCHI:
-        return await pubchem_client.get_canonical_smiles_by_inchi(parsed.raw)
+        smiles = await pubchem_client.get_canonical_smiles_by_inchi(parsed.raw)
+        return smiles, ""
 
-    return await pubchem_client.get_canonical_smiles_by_name(parsed.raw)
+    # For names, PubChem remains the primary resolver.
+    smiles = await pubchem_client.get_canonical_smiles_by_name(parsed.raw)
+    if smiles:
+        return smiles, ""
+
+    # Final local fallback catches simple SMILES such as CCO/CCC that the old
+    # detector intentionally classified as names.
+    mol = Chem.MolFromSmiles(raw)
+    if mol is not None:
+        return Chem.MolToSmiles(mol), f"'{raw}' was interpreted as a SMILES string."
+    return None, ""
+
+
+async def resolve_compound_to_smiles(token: str) -> Optional[str]:
+    smiles, _ = await resolve_species(token)
+    return smiles
 
 
 # ============================================================================
-# 5. 2D drawing (ChemDraw-style) — molecules and reaction schemes
+# 4. 2D drawing — integrated from chem_core.py
 # ============================================================================
-def _apply_common_draw_options(drawer: rdMolDraw2D.MolDraw2D) -> None:
+def _apply_common_draw_options(drawer) -> None:
     opts = drawer.drawOptions()
     opts.addStereoAnnotation = True
     opts.bondLineWidth = DRAWING_BOND_LINE_WIDTH
-    opts.baseFontSize = DRAWING_FONT_SCALE * opts.baseFontSize if opts.baseFontSize else 0.6
+    opts.baseFontSize = DRAWING_FONT_SCALE * (opts.baseFontSize or 0.6)
     opts.padding = 0.12
     opts.legendFontSize = 18
 
 
-def render_molecule(
-    smiles: str,
-    legend: str = "",
-    size: Sequence[int] = MOL_IMAGE_SIZE,
-    as_svg: bool = False,
-) -> Optional[bytes]:
-    """Render a single molecule from SMILES as a 2D PNG (default) or SVG."""
+def render_molecule(smiles: str, legend: str = "", size=MOL_IMAGE_SIZE, as_svg: bool = False) -> Optional[bytes]:
     mol = Chem.MolFromSmiles(smiles)
     if mol is None:
-        chem_logger.warning("RDKit could not parse SMILES: %s", smiles)
         return None
-
     try:
         AllChem.Compute2DCoords(mol)
         Chem.rdDepictor.StraightenDepiction(mol)
-    except Exception as exc:  # noqa: BLE001 - depiction cleanup is best-effort
+    except Exception as exc:
         chem_logger.debug("2D coordinate refinement skipped: %s", exc)
-
     drawer_cls = rdMolDraw2D.MolDraw2DSVG if as_svg else rdMolDraw2D.MolDraw2DCairo
     drawer = drawer_cls(size[0], size[1])
     _apply_common_draw_options(drawer)
-
     rdMolDraw2D.PrepareAndDrawMolecule(drawer, mol, legend=legend)
     drawer.FinishDrawing()
-
-    if as_svg:
-        return drawer.GetDrawingText().encode("utf-8")
-    return drawer.GetDrawingText()
+    return drawer.GetDrawingText().encode("utf-8") if as_svg else drawer.GetDrawingText()
 
 
-def render_reaction_scheme(
-    reactant_smiles: List[str],
-    product_smiles: List[str],
-    sub_image_size: Sequence[int] = REACTION_SUBIMAGE_SIZE,
-    as_svg: bool = False,
-) -> Optional[bytes]:
-    """Render a full 2D reaction scheme with '+' separators and an arrow."""
-    reaction_smarts = f"{'.'.join(reactant_smiles)}>>{'.'.join(product_smiles)}"
-    rxn = rdChemReactions.ReactionFromSmarts(reaction_smarts, useSmiles=True)
-    if rxn is None:
-        chem_logger.warning("RDKit could not parse reaction: %s", reaction_smarts)
-        return None
+_FONT_CANDIDATES = (
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+    "/usr/share/fonts/TTF/DejaVuSans.ttf",
+    "/System/Library/Fonts/Helvetica.ttc",
+)
+_FORMULA_TOKEN_RE = re.compile(r"([A-Za-z]+|\d+|[+-]\d*)")
 
+
+def _layout_font(size: int):
+    from PIL import ImageFont
+    for path in _FONT_CANDIDATES:
+        try:
+            return ImageFont.truetype(path, size)
+        except Exception:
+            continue
     try:
-        rdChemReactions.Compute2DCoordsForReaction(rxn)
-    except Exception as exc:  # noqa: BLE001
-        chem_logger.warning("Reaction 2D coordinate generation failed: %s", exc)
+        return ImageFont.load_default(size=size)
+    except TypeError:
+        return ImageFont.load_default()
+
+
+def _formula_tokens(formula: str):
+    tokens = []
+    parts = [p for p in _FORMULA_TOKEN_RE.split(formula or "") if p]
+    for i, part in enumerate(parts):
+        if part[0] in "+-":
+            tokens.append((part[1:] + part[0] if len(part) > 1 else part, "sup"))
+        elif part.isdigit():
+            tokens.append((part, "sub" if i and parts[i - 1][0].isalpha() else "normal"))
+        else:
+            tokens.append((part, "normal"))
+    return tokens
+
+
+def _render_formula_image(formula: str, size: int):
+    from PIL import Image, ImageDraw
+    base_font = _layout_font(size)
+    small_font = _layout_font(max(10, int(size * 0.62)))
+    tokens = _formula_tokens(formula)
+    probe = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+    widths, ascent = [], 0
+    for text, style in tokens:
+        font = small_font if style in ("sub", "sup") else base_font
+        box = probe.textbbox((0, 0), text, font=font)
+        widths.append(box[2] - box[0])
+        ascent = max(ascent, box[3] - box[1])
+    shift = max(3, int(size * 0.20))
+    pad = max(4, size // 5)
+    canvas = Image.new("RGB", (sum(widths) + pad * 2, ascent + shift * 2 + pad * 2), (255, 255, 255))
+    pen = ImageDraw.Draw(canvas)
+    x, baseline = pad, pad + shift
+    for (text, style), width in zip(tokens, widths):
+        font = small_font if style in ("sub", "sup") else base_font
+        box = pen.textbbox((0, 0), text, font=font)
+        y = baseline - box[1]
+        if style == "sub":
+            y += ascent - (box[3] - box[1]) + shift
+        elif style == "sup":
+            y -= shift
+        pen.text((x - box[0], y), text, fill=(20, 20, 20), font=font)
+        x += width
+    return canvas
+
+
+_FORMULA_BY_CANONICAL_SMILES = {}
+for _smiles, _formula in _CONVENTIONAL_FORMULAS.items():
+    _mol = Chem.MolFromSmiles(_smiles)
+    if _mol is not None:
+        _FORMULA_BY_CANONICAL_SMILES[Chem.MolToSmiles(_mol)] = _formula
+
+
+def formula_for_display(smiles: str) -> str | None:
+    mol = Chem.MolFromSmiles(smiles or "")
+    if mol is None:
+        return None
+    canonical = Chem.MolToSmiles(mol)
+    if canonical in _FORMULA_BY_CANONICAL_SMILES:
+        return _FORMULA_BY_CANONICAL_SMILES[canonical]
+    carbons = sum(1 for a in mol.GetAtoms() if a.GetSymbol() == "C")
+    if mol.GetRingInfo().NumRings() or carbons > 1 or mol.GetNumHeavyAtoms() > 4:
+        return None
+    if carbons and any(a.GetSymbol() in ("O", "N", "S") and a.GetTotalNumHs() for a in mol.GetAtoms()):
+        return None
+    from rdkit.Chem import rdMolDescriptors
+    hill = rdMolDescriptors.CalcMolFormula(mol)
+    if not carbons and hill.startswith("H"):
+        return None
+    return hill
+
+
+def _trim_white(image, pad: int = 6):
+    from PIL import Image, ImageChops
+    background = Image.new(image.mode, image.size, (255, 255, 255))
+    box = ImageChops.difference(image, background).getbbox()
+    if not box:
+        return image
+    left, top, right, bottom = box
+    return image.crop((max(0, left - pad), max(0, top - pad), min(image.width, right + pad), min(image.height, bottom + pad)))
+
+
+def render_reaction_scheme(reactant_pairs, product_pairs, sub_size=REACTION_SUBIMAGE_SIZE, small_as_formula: bool = True) -> bytes | None:
+    """Publication-style reaction image with coefficients, formulas, structures and a clean arrow."""
+    from PIL import Image, ImageDraw
+
+    def draw_one(smiles):
+        mol = Chem.MolFromSmiles(smiles)
+        if mol is None:
+            return None
+        AllChem.Compute2DCoords(mol)
+        drawer = rdMolDraw2D.MolDraw2DCairo(sub_size[0], sub_size[1])
+        _apply_common_draw_options(drawer)
+        try:
+            drawer.drawOptions().fixedBondLength = max(24, sub_size[1] // 7)
+        except Exception:
+            pass
+        rdMolDraw2D.PrepareAndDrawMolecule(drawer, mol)
+        drawer.FinishDrawing()
+        return _trim_white(Image.open(io.BytesIO(drawer.GetDrawingText())).convert("RGB"))
+
+    formula_size = max(30, sub_size[1] // 6)
+    arrow_length = max(60, sub_size[0] // 5)
+    arrow_head = max(14, sub_size[1] // 20)
+    coefficient_font = _layout_font(formula_size)
+    operator_font = _layout_font(formula_size)
+
+    tokens: list[tuple[str, object]] = []
+    for side_index, pairs in enumerate((reactant_pairs, product_pairs)):
+        if side_index:
+            tokens.append(("arrow", None))
+        for i, (coefficient, smiles) in enumerate(pairs):
+            if i:
+                tokens.append(("op", "+"))
+            formula = formula_for_display(smiles) if small_as_formula else None
+            image = _render_formula_image(formula, formula_size) if formula else draw_one(smiles)
+            if image is None:
+                return None
+            label = ReactionTerm(Fraction(coefficient), "").pretty_coefficient
+            if label:
+                tokens.append(("coefficient", label))
+            tokens.append(("mol", image))
+
+    if not tokens:
         return None
 
-    n_components = rxn.GetNumReactantTemplates() + rxn.GetNumProductTemplates()
-    width = sub_image_size[0] * max(n_components, 1)
-    height = sub_image_size[1]
+    probe = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+    gap = max(10, sub_size[0] // 28)
+    widths, heights = [], []
+    for kind, payload in tokens:
+        if kind == "mol":
+            widths.append(payload.width); heights.append(payload.height)
+        elif kind == "arrow":
+            widths.append(arrow_length); heights.append(arrow_head)
+        else:
+            font = coefficient_font if kind == "coefficient" else operator_font
+            box = probe.textbbox((0, 0), payload, font=font)
+            widths.append(box[2] - box[0]); heights.append(box[3] - box[1])
 
-    drawer_cls = rdMolDraw2D.MolDraw2DSVG if as_svg else rdMolDraw2D.MolDraw2DCairo
-    drawer = drawer_cls(width, height)
-    _apply_common_draw_options(drawer)
+    margin = gap * 2
+    total_width = sum(widths) + gap * (len(tokens) - 1) + margin * 2
+    total_height = max(heights) + margin * 2
+    canvas = Image.new("RGB", (total_width, total_height), (255, 255, 255))
+    pen = ImageDraw.Draw(canvas)
+    x = margin
+    for (kind, payload), width in zip(tokens, widths):
+        if kind == "mol":
+            canvas.paste(payload, (x, (total_height - payload.height) // 2))
+        elif kind == "arrow":
+            mid = total_height // 2
+            pen.line([(x, mid), (x + arrow_length - arrow_head, mid)], fill=(20, 20, 20), width=max(2, arrow_head // 7))
+            pen.polygon([(x + arrow_length, mid), (x + arrow_length - arrow_head, mid - arrow_head // 2),
+                         (x + arrow_length - arrow_head, mid + arrow_head // 2)], fill=(20, 20, 20))
+        else:
+            font = coefficient_font if kind == "coefficient" else operator_font
+            box = pen.textbbox((0, 0), payload, font=font)
+            pen.text((x - box[0], (total_height - (box[3] - box[1])) // 2 - box[1]), payload, fill=(20, 20, 20), font=font)
+        x += width + (gap // 2 if kind == "coefficient" else gap)
 
-    drawer.DrawReaction(rxn)
-    drawer.FinishDrawing()
-
-    if as_svg:
-        return drawer.GetDrawingText().encode("utf-8")
-    return drawer.GetDrawingText()
+    out = io.BytesIO()
+    canvas.save(out, format="PNG")
+    return out.getvalue()
 
 
 def bytes_to_named_bytesio(data: bytes, filename: str) -> io.BytesIO:
@@ -1663,43 +1912,180 @@ def bytes_to_named_bytesio(data: bytes, filename: str) -> io.BytesIO:
 
 
 # ============================================================================
-# 6. Editable ChemDraw-compatible file generation (.mol / .rxn)
+# 5. Chemical validation + editable RXN — integrated from chem_core.py
 # ============================================================================
-def generate_rxn_file(
-    reactant_smiles: List[str],
-    product_smiles: List[str],
-    filename: str,
-) -> Optional[io.BytesIO]:
-    """Build a 2D .rxn (MDL Reaction) file from reactant/product SMILES."""
-    reaction_smiles = f"{'.'.join(reactant_smiles)}>>{'.'.join(product_smiles)}"
+def _element_counts(smiles: str) -> tuple[dict[str, int], int] | None:
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        return None
+    counts: dict[str, int] = {}
+    charge = 0
+    for atom in mol.GetAtoms():
+        counts[atom.GetSymbol()] = counts.get(atom.GetSymbol(), 0) + 1
+        h = atom.GetTotalNumHs()
+        if h:
+            counts["H"] = counts.get("H", 0) + h
+        charge += atom.GetFormalCharge()
+    return counts, charge
+
+
+def check_reaction_balance(reactant_pairs, product_pairs) -> dict:
+    def side_totals(pairs):
+        totals: dict[str, Fraction] = {}
+        charge = Fraction(0)
+        for coefficient, smiles in pairs:
+            parsed = _element_counts(smiles)
+            if parsed is None:
+                return None, None
+            counts, q = parsed
+            for element, n in counts.items():
+                totals[element] = totals.get(element, Fraction(0)) + Fraction(coefficient) * n
+            charge += Fraction(coefficient) * q
+        return totals, charge
+
+    left, left_charge = side_totals(reactant_pairs)
+    right, right_charge = side_totals(product_pairs)
+    if left is None or right is None:
+        return {"checked": False, "balanced": False, "message": "The structures could not be read, so balance was not checked."}
+
+    diffs = {}
+    for element in sorted(set(left) | set(right)):
+        delta = right.get(element, Fraction(0)) - left.get(element, Fraction(0))
+        if delta != 0:
+            diffs[element] = delta
+    charge_delta = right_charge - left_charge
+
+    def fmt(value):
+        value = Fraction(value)
+        return str(value.numerator) if value.denominator == 1 else str(value)
+
+    if not diffs and charge_delta == 0:
+        return {"checked": True, "balanced": True,
+                "message": "✓ The equation is balanced: every element and the total charge match on both sides."}
+
+    parts = []
+    for element, delta in diffs.items():
+        side = "product" if delta > 0 else "reactant"
+        parts.append(f"{fmt(abs(delta))} {element} on the {side} side")
+    if charge_delta != 0:
+        parts.append(f"a net charge difference of {fmt(charge_delta)}")
+    return {"checked": True, "balanced": False,
+            "element_difference": {e: fmt(d) for e, d in diffs.items()},
+            "excess_side": {e: ("product" if d > 0 else "reactant") for e, d in diffs.items()},
+            "excess_amount": {e: fmt(abs(d)) for e, d in diffs.items()},
+            "charge_difference": fmt(charge_delta),
+            "message": "⚠ The equation is NOT balanced — there is an excess of " + "; ".join(parts) + ". The scheme was still drawn."}
+
+
+def validate_rxn_block(text: str) -> dict:
+    problems: list[str] = []
+    lines = (text or "").splitlines()
+    if not lines or lines[0].strip() != "$RXN":
+        return {"valid": False, "problems": ["the file does not begin with the $RXN header"]}
+    if len(lines) < 5:
+        return {"valid": False, "problems": ["the $RXN header is incomplete"]}
+    try:
+        n_reactants = int(lines[4][0:3])
+        n_products = int(lines[4][3:6])
+    except (ValueError, IndexError):
+        return {"valid": False, "problems": ["the reactant/product counts line is not in MDL fixed-column form"]}
+
+    blocks, current = [], None
+    for line in lines[5:]:
+        if line.strip() == "$MOL":
+            if current is not None:
+                blocks.append(current)
+            current = []
+        elif current is not None:
+            current.append(line)
+    if current is not None:
+        blocks.append(current)
+
+    if len(blocks) != n_reactants + n_products:
+        problems.append(f"the header declares {n_reactants + n_products} components but the file contains {len(blocks)}")
+    for i, block in enumerate(blocks, 1):
+        if not any(l.rstrip().endswith(("V2000", "V3000")) for l in block[:6]):
+            problems.append(f"component {i} has no V2000/V3000 counts line")
+        if not any(l.strip() == "M  END" for l in block):
+            problems.append(f"component {i} is not terminated with 'M  END'")
+    return {"valid": not problems, "problems": problems,
+            "format": "MDL RXN V2000", "reactants": n_reactants, "products": n_products,
+            "opens_in": ["ChemDraw", "ChemDraw JS", "MarvinSketch", "ISIS/Draw", "Avogadro", "RDKit", "Open Babel"]}
+
+
+def generate_rxn_file(reactant_pairs, product_pairs, filename: str, title: str = "") -> Optional[io.BytesIO]:
+    """Generate a validated MDL RXN file; fractional coefficients are scaled exactly."""
+    _, scaled = scale_terms_to_integers(reactant_pairs, product_pairs)
+    reactant_pairs_i, product_pairs_i = scaled
+
+    def expand(pairs):
+        out = []
+        for coefficient, smiles in pairs:
+            n = Fraction(coefficient)
+            if n.denominator != 1 or n <= 0:
+                return None
+            out.extend([smiles] * int(n))
+        return out
+
+    left, right = expand(reactant_pairs_i), expand(product_pairs_i)
+    if not left or not right:
+        return None
+    reaction_smiles = f"{'.'.join(left)}>>{'.'.join(right)}"
     try:
         rxn = rdChemReactions.ReactionFromSmarts(reaction_smiles, useSmiles=True)
         if rxn is None:
             return None
         rdChemReactions.Compute2DCoordsForReaction(rxn)
-        rxn_block = rdChemReactions.ReactionToRxnBlock(rxn)
-    except Exception as exc:  # noqa: BLE001
+        block = rdChemReactions.ReactionToRxnBlock(rxn)
+        if title:
+            lines = block.split("\n")
+            if len(lines) > 2:
+                lines[1] = title[:80]
+                block = "\n".join(lines)
+        validation = validate_rxn_block(block)
+        if not validation["valid"]:
+            chem_logger.warning("Generated RXN failed structural validation: %s", validation["problems"])
+            return None
+    except Exception as exc:
         chem_logger.warning("RXN file generation failed for '%s': %s", reaction_smiles, exc)
         return None
 
-    rxn_file = io.BytesIO(rxn_block.encode("utf-8"))
+    rxn_file = io.BytesIO(block.encode("utf-8"))
     rxn_file.name = filename
     rxn_file.seek(0)
     return rxn_file
 
 
+
+def generate_single_rxn_file(smiles: str, filename: str) -> Optional[io.BytesIO]:
+    """Backward-compatible single-species RXN output used by the original bot."""
+    try:
+        rxn = rdChemReactions.ReactionFromSmarts(f"{smiles}>>", useSmiles=True)
+        if rxn is None:
+            return None
+        rdChemReactions.Compute2DCoordsForReaction(rxn)
+        block = rdChemReactions.ReactionToRxnBlock(rxn)
+        validation = validate_rxn_block(block)
+        if not validation["valid"]:
+            return None
+    except Exception as exc:
+        chem_logger.warning("Single RXN generation failed for '%s': %s", smiles, exc)
+        return None
+    rxn_file = io.BytesIO(block.encode("utf-8"))
+    rxn_file.name = filename
+    rxn_file.seek(0)
+    return rxn_file
+
 def generate_mol_file(smiles: str, filename: str) -> Optional[io.BytesIO]:
-    """Build a 2D .mol (MDL Molfile) file from a single compound's SMILES."""
     try:
         mol = Chem.MolFromSmiles(smiles)
         if mol is None:
             return None
         AllChem.Compute2DCoords(mol)
         mol_block = Chem.MolToMolBlock(mol)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         chem_logger.warning("MOL file generation failed for '%s': %s", smiles, exc)
         return None
-
     mol_file = io.BytesIO(mol_block.encode("utf-8"))
     mol_file.name = filename
     mol_file.seek(0)
@@ -1707,32 +2093,30 @@ def generate_mol_file(smiles: str, filename: str) -> Optional[io.BytesIO]:
 
 
 # ============================================================================
-# 7. Telegram handlers
+# 6. Telegram handlers
 # ============================================================================
 WELCOME_TEXT = (
     "Welcome to the Chemistry Drawing Bot! 🧪\n\n"
-    "I turn compound names, SMILES, or InChI strings into clean 2D "
-    "structures and editable files you can open in ChemDraw.\n\n"
+    "I turn compound names, SMILES, or InChI strings into clean 2D structures "
+    "and editable files you can open in ChemDraw.\n\n"
     "<b>Single compound</b>\n"
     "Send a name, SMILES, or InChI directly, e.g. <code>Aspirin</code>\n\n"
     "<b>Reaction scheme</b>\n"
-    "Separate reactants and products with '=' and join multiple compounds "
-    "with '+', e.g.\n"
+    "Separate reactants and products with '=' and join multiple compounds with '+'.\n"
+    "Examples:\n"
+    "<code>2 H2 + O2 = 2 H2O</code>\n"
     "<code>Methane + Oxygen = Carbon Dioxide + Water</code>\n\n"
-    "Note: I draw exactly what you enter, including hypothetical or "
-    "unpublished reactions — I don't validate chemical correctness."
+    "The bot preserves coefficients, draws the scheme, checks balance, and sends an editable .rxn file."
 )
 NOT_FOUND_TEXT = (
     "⚠️ I couldn't resolve '<code>{name}</code>'.\n"
-    "Double-check the spelling (English names work best), or try a "
-    "SMILES / InChI string instead."
+    "Double-check the spelling (English names work best), or try a SMILES / InChI string instead."
 )
 GENERIC_ERROR_TEXT = "❌ A technical error occurred while processing your request. Please try again."
 PROCESSING_TEXT = "⚙️ Processing your request..."
 
 
 async def notify_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Best-effort activity notification to the bot admin. Never raises."""
     try:
         user = update.effective_user
         if not user:
@@ -1746,7 +2130,7 @@ async def notify_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             f"Message: {html.escape(update.message.text or '')}"
         )
         await context.bot.send_message(chat_id=ADMIN_ID, text=text, parse_mode="HTML")
-    except Exception as exc:  # noqa: BLE001 - admin notification must never break the bot
+    except Exception as exc:
         chem_logger.debug("Admin notification skipped: %s", exc)
 
 
@@ -1756,9 +2140,17 @@ async def chem_start_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await update.message.reply_text(WELCOME_TEXT, parse_mode="HTML")
 
 
-async def _resolve_all(names: List[str]) -> Dict[str, Optional[str]]:
-    results = await asyncio.gather(*(resolve_compound_to_smiles(name) for name in names))
-    return dict(zip(names, results))
+async def _resolve_terms(terms: list[ReactionTerm]):
+    results = await asyncio.gather(*(resolve_species(term.name) for term in terms))
+    resolved, notes = [], []
+    for term, (smiles, note) in zip(terms, results):
+        if smiles:
+            resolved.append((term.coefficient, smiles))
+            if note:
+                notes.append(note)
+        else:
+            resolved.append((term.coefficient, None))
+    return resolved, notes
 
 
 async def _handle_single_compound(update: Update, status_msg, text: str) -> None:
@@ -1766,7 +2158,6 @@ async def _handle_single_compound(update: Update, status_msg, text: str) -> None
     if not compounds:
         await status_msg.delete()
         return
-
     name = compounds[0]
     smiles = await resolve_compound_to_smiles(name)
     if not smiles:
@@ -1775,10 +2166,9 @@ async def _handle_single_compound(update: Update, status_msg, text: str) -> None
 
     image_bytes, rxn_file, mol_file = await asyncio.gather(
         asyncio.to_thread(render_molecule, smiles, name),
-        asyncio.to_thread(generate_rxn_file, [smiles], [], f"{safe_filename(name)}.rxn"),
+        asyncio.to_thread(generate_single_rxn_file, smiles, f"{safe_filename(name)}.rxn"),
         asyncio.to_thread(generate_mol_file, smiles, f"{safe_filename(name)}.mol"),
     )
-
     if image_bytes:
         photo = bytes_to_named_bytesio(image_bytes, f"{safe_filename(name)}.png")
         await update.message.reply_photo(
@@ -1790,7 +2180,6 @@ async def _handle_single_compound(update: Update, status_msg, text: str) -> None
         await update.message.reply_document(document=rxn_file, caption="Editable reaction file (.rxn)")
     if mol_file:
         await update.message.reply_document(document=mol_file, caption="Editable molecule file (.mol)")
-
     await status_msg.delete()
 
 
@@ -1800,32 +2189,57 @@ async def _handle_reaction(update: Update, status_msg, text: str) -> None:
         await status_msg.edit_text("⚠️ Please use exactly one '=' sign to separate reactants and products.")
         return
 
-    reactant_names = split_compound_list(parts[0])
-    product_names = split_compound_list(parts[1])
-    if not reactant_names or not product_names:
+    reactant_terms = split_compound_terms(parts[0])
+    product_terms = split_compound_terms(parts[1])
+    if not reactant_terms or not product_terms:
         await status_msg.edit_text("⚠️ Please provide at least one compound on each side of the reaction.")
         return
 
-    smiles_map = await _resolve_all(reactant_names + product_names)
-    unresolved = [name for name, smiles in smiles_map.items() if not smiles]
+    reactant_resolved, reactant_notes = await _resolve_terms(reactant_terms)
+    product_resolved, product_notes = await _resolve_terms(product_terms)
+    unresolved = []
+    for term, (coefficient, smiles) in zip(reactant_terms, reactant_resolved):
+        if smiles is None:
+            unresolved.append(term.name)
+    for term, (coefficient, smiles) in zip(product_terms, product_resolved):
+        if smiles is None:
+            unresolved.append(term.name)
     if unresolved:
         joined = ", ".join(html.escape(n) for n in unresolved)
         await status_msg.edit_text(NOT_FOUND_TEXT.format(name=joined), parse_mode="HTML")
         return
 
-    reactant_smiles = [smiles_map[n] for n in reactant_names]
-    product_smiles = [smiles_map[n] for n in product_names]
+    reactant_pairs = [(coef, smiles) for coef, smiles in reactant_resolved]
+    product_pairs = [(coef, smiles) for coef, smiles in product_resolved]
+
+    balance = check_reaction_balance(reactant_pairs, product_pairs)
+    equation = format_equation(reactant_terms, product_terms)
+    rxn_title = equation
 
     scheme_bytes, rxn_file = await asyncio.gather(
-        asyncio.to_thread(render_reaction_scheme, reactant_smiles, product_smiles),
-        asyncio.to_thread(generate_rxn_file, reactant_smiles, product_smiles, "Reaction.rxn"),
+        asyncio.to_thread(render_reaction_scheme, reactant_pairs, product_pairs),
+        asyncio.to_thread(generate_rxn_file, reactant_pairs, product_pairs, "Reaction.rxn", rxn_title),
     )
+
+    caption_lines = ["Reaction scheme:", f"<code>{html.escape(equation)}</code>"]
+    if balance.get("checked"):
+        caption_lines.append(html.escape(balance["message"]))
+    if reactant_notes or product_notes:
+        # Keep ambiguity explanations short and visible without blocking the drawing.
+        for note in (reactant_notes + product_notes)[:3]:
+            caption_lines.append("ℹ️ " + html.escape(note))
+    caption = "\n".join(caption_lines)
 
     if scheme_bytes:
         photo = bytes_to_named_bytesio(scheme_bytes, "Reaction.png")
-        await update.message.reply_photo(photo=photo, caption="Reaction scheme:")
+        await update.message.reply_photo(photo=photo, caption=caption, parse_mode="HTML")
+    else:
+        chem_logger.warning("Reaction PNG rendering failed for %s", equation)
+
     if rxn_file:
         await update.message.reply_document(document=rxn_file, caption="Editable reaction file (.rxn)")
+    else:
+        chem_logger.warning("Reaction RXN generation failed for %s", equation)
 
     await status_msg.delete()
 
@@ -1834,21 +2248,19 @@ async def handle_chemical_message(update: Update, context: ContextTypes.DEFAULT_
     text = (update.message.text or "").strip()
     if not text:
         return
-
     chem_logger.info("Message from %s: %s", update.effective_user.id if update.effective_user else "unknown", text)
     asyncio.create_task(notify_admin(update, context))
     status_msg = await update.message.reply_text(PROCESSING_TEXT)
-
     try:
         if "=" in text:
             await _handle_reaction(update, status_msg, text)
         else:
             await _handle_single_compound(update, status_msg, text)
-    except Exception as exc:  # noqa: BLE001 - top-level safety net for handler
+    except Exception as exc:
         chem_logger.error("Error while processing message '%s': %s", text, exc, exc_info=True)
         try:
             await status_msg.edit_text(GENERIC_ERROR_TEXT)
-        except Exception:  # noqa: BLE001 - status message may already be gone
+        except Exception:
             pass
 
 
@@ -1860,7 +2272,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 # ============================================================================
-# 8. Application wiring & entrypoint
+# 7. Application wiring & entrypoint
 # ============================================================================
 async def _on_startup(application: Application) -> None:
     await pubchem_client.start()
@@ -1873,12 +2285,8 @@ async def _on_shutdown(application: Application) -> None:
 
 
 def run_chem_bot() -> None:
-    """يشغّل بوت الكيمياء بطريقة polling. مصمّمة للعمل داخل Thread خلفي
-    (وليس الـ Thread الرئيسي) لأن الـ Thread الرئيسي مشغول بخادم Flask الخاص
-    ببوت ORCA. لذلك stop_signals=None لتعطيل تسجيل معالجات الإشارات (signal
-    handlers) التي لا يمكن تسجيلها إلا في الـ Thread الرئيسي في بايثون."""
     if not CHEM_BOT_TOKEN:
-        chem_logger.error("CRITICAL: CHEM_BOT_TOKEN is not set. Check environment variables. Chemistry bot will NOT start.")
+        chem_logger.error("CRITICAL: CHEM_BOT_TOKEN is not set. Chemistry bot will NOT start.")
         return
 
     application = (
@@ -1888,7 +2296,6 @@ def run_chem_bot() -> None:
         .post_shutdown(_on_shutdown)
         .build()
     )
-
     application.add_handler(CommandHandler(["start", "help"], chem_start_command))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_chemical_message))
     application.add_error_handler(error_handler)
@@ -1901,29 +2308,17 @@ def run_chem_bot() -> None:
         close_loop=False,
     )
 
+
 # ══════════════════════════════════════════════════════════════════════════
 # ██  نقطة الدخول المدمجة: تشغيل البوتين معاً في عملية واحدة  ██
 # ══════════════════════════════════════════════════════════════════════════
 def main():
-    # 1) بوت الكيمياء (Polling) يعمل في Thread خلفي منفصل (daemon)، لأنه لا
-    #    يفتح أي منفذ ولا يحتاج أن يكون في الـ Thread الرئيسي.
     if CHEM_BOT_TOKEN:
-        chem_thread = threading.Thread(
-            target=run_chem_bot,
-            name='chem-bot-polling',
-            daemon=True,
-        )
+        chem_thread = threading.Thread(target=run_chem_bot, name='chem-bot-polling', daemon=True)
         chem_thread.start()
         orca_logger.info('تم بدء بوت الكيمياء (Chemistry Bot) في Thread خلفي (Polling).')
     else:
-        orca_logger.warning(
-            'CHEM_BOT_TOKEN غير مضبوط — بوت الكيمياء لن يعمل. '
-            'بوت ORCA سيستمر بالعمل بشكل طبيعي.'
-        )
-
-    # 2) بوت ORCA (Webhook) يعمل في الـ Thread الرئيسي عبر خادم Flask، وهو من
-    #    يفتح المنفذ الذي يطلبه Render (متغيّر البيئة PORT). يبقى هذا الاستدعاء
-    #    محظوراً (blocking) طوال عمر العملية، وهذا هو المطلوب بالضبط.
+        orca_logger.warning('CHEM_BOT_TOKEN غير مضبوط — بوت الكيمياء لن يعمل. بوت ORCA سيستمر بالعمل بشكل طبيعي.')
     run_orca_flask_server()
 
 
