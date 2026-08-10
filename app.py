@@ -1660,6 +1660,33 @@ class PubChemClient:
     async def get_canonical_smiles_by_cas(self, cas_number: str) -> Optional[str]:
         return await self._resolve("name", cas_number)
 
+    async def get_canonical_smiles_by_cid(self, cid: int | str) -> Optional[str]:
+        """Resolve a PubChem Compound CID directly. Useful for verified synonyms."""
+        value = str(cid).strip()
+        cache_key = f"cid:{value}"
+        cached = self._cache.get(cache_key)
+        if cached is not None:
+            return cached
+        if self._client is None:
+            await self.start()
+        url = f"{PUBCHEM_BASE_URL}/compound/cid/{urllib.parse.quote(value, safe='')}/property/IsomericSMILES/TXT"
+        async with self._semaphore:
+            try:
+                assert self._client is not None
+                response = await self._client.get(url)
+                response.raise_for_status()
+                smiles = response.text.strip().splitlines()[0].strip()
+                mol = Chem.MolFromSmiles(smiles)
+                if mol is None:
+                    return None
+                smiles = Chem.MolToSmiles(mol, isomericSmiles=True)
+                self._cache.set(cache_key, smiles)
+                return smiles
+            except (httpx.HTTPStatusError, httpx.HTTPError, IndexError) as exc:
+                chem_logger.info("PubChem CID lookup failed for '%s': %s", value, exc)
+                self._cache.set(cache_key, None)
+                return None
+
     async def get_canonical_smiles_by_inchi(self, inchi: str) -> Optional[str]:
         return await self._resolve("inchi", inchi)
 
@@ -1721,6 +1748,22 @@ pubchem_client = PubChemClient()
 # ============================================================================
 # 3. Local formula/ambiguity handling — integrated from chem_core.py
 # ============================================================================
+# Verified/common chemical aliases. These are used only as a fallback after
+# the normal name/CAS/SMILES resolution path. Keeping them here prevents
+# ordinary reagent abbreviations and known impurity synonyms from being sent
+# blindly to RDKit as if they were SMILES.
+LOCAL_ALIASES = {
+    "nbs": ("name", "N-bromosuccinimide"),
+    "n-bromosuccinimide": ("name", "N-bromosuccinimide"),
+    "5-bromonaproxen": ("cid", "11529664"),
+    "5-bromo naproxen": ("cid", "11529664"),
+    "5-bromo-naproxen": ("cid", "11529664"),
+    "5-bromo-6-methoxy-alpha-methyl-2-naphthaleneacetic acid": ("cid", "11529664"),
+    "naproxen impurity c": ("cid", "11529664"),
+    "naproxen impurity c (ph eur)": ("cid", "11529664"),
+}
+
+
 AMBIGUOUS_TOKENS = {
     "CO": "carbon monoxide", "NO": "nitric oxide", "CS": "carbon monosulfide",
     "NC": "cyanide", "OS": "osmium", "SN": "tin", "PS": "phosphorus sulfide",
@@ -1817,10 +1860,22 @@ async def resolve_species(token: str) -> tuple[str | None, str]:
         if smiles:
             return smiles, ""
 
-    # NCI/CADD Chemical Identifier Resolver fallback. This is especially useful
-    # for chemical synonyms that are present in chemical-name databases but are
-    # not indexed as an exact PubChem compound-name query, e.g.
-    # "5-bromonaproxen" / "5-bromo naproxen".
+    # Verified/local synonym fallback. This is deliberately before CIR:
+    # CIR can return HTTP 500 for some valid names, while a verified PubChem CID
+    # gives an unambiguous structure and preserves stereochemistry.
+    alias_key = re.sub(r"\s+", " ", parsed.raw).strip().lower()
+    alias = LOCAL_ALIASES.get(alias_key)
+    if alias:
+        source, value = alias
+        if source == "cid":
+            smiles = await pubchem_client.get_canonical_smiles_by_cid(value)
+        else:
+            smiles = await pubchem_client.get_canonical_smiles_by_name(value)
+        if smiles:
+            return smiles, f"Resolved using verified synonym: {parsed.raw}"
+
+    # NCI/CADD Chemical Identifier Resolver fallback. This remains a generic
+    # fallback for names not covered by PubChem exact lookup or local aliases.
     cir_candidates = []
     for candidate in (parsed.raw, normalized, compact):
         if candidate and candidate.lower() not in {c.lower() for c in cir_candidates}:
