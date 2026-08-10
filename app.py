@@ -1404,6 +1404,7 @@ CHEM_BOT_TOKEN: Optional[str] = os.environ.get("CHEM_BOT_TOKEN")
 ADMIN_ID: int = int(os.environ.get("ADMIN_ID", "7495822836"))
 
 PUBCHEM_BASE_URL = "https://pubchem.ncbi.nlm.nih.gov/rest/pug"
+CIR_BASE_URL = "https://cactus.nci.nih.gov/chemical/structure"
 PUBCHEM_TIMEOUT_SECONDS = 10.0
 PUBCHEM_MAX_CONCURRENT_REQUESTS = 4
 PUBCHEM_CACHE_MAX_ENTRIES = 512
@@ -1662,6 +1663,33 @@ class PubChemClient:
     async def get_canonical_smiles_by_inchi(self, inchi: str) -> Optional[str]:
         return await self._resolve("inchi", inchi)
 
+    async def resolve_via_cir(self, identifier: str) -> Optional[str]:
+        """Fallback resolver using the NCI/CADD Chemical Identifier Resolver.
+
+        CIR accepts chemical names, registry numbers, SMILES and InChI and
+        returns a SMILES representation. It is used only after PubChem fails,
+        so PubChem remains the primary source.
+        """
+        if self._client is None:
+            await self.start()
+        encoded = urllib.parse.quote(identifier.strip(), safe="")
+        url = f"{CIR_BASE_URL}/{encoded}/smiles"
+        async with self._semaphore:
+            try:
+                assert self._client is not None
+                response = await self._client.get(url)
+                response.raise_for_status()
+                smiles = response.text.strip().splitlines()[0].strip()
+                if not smiles:
+                    return None
+                mol = Chem.MolFromSmiles(smiles)
+                if mol is None:
+                    return None
+                return Chem.MolToSmiles(mol, isomericSmiles=True)
+            except (httpx.HTTPStatusError, httpx.HTTPError, IndexError) as exc:
+                chem_logger.info("CIR could not resolve '%s': %s", identifier, exc)
+                return None
+
     async def _resolve(self, namespace: str, value: str) -> Optional[str]:
         cache_key = f"{namespace}:{value.lower().strip()}"
         cached = self._cache.get(cache_key)
@@ -1788,6 +1816,19 @@ async def resolve_species(token: str) -> tuple[str | None, str]:
         smiles = await pubchem_client.get_canonical_smiles_by_name(compact)
         if smiles:
             return smiles, ""
+
+    # NCI/CADD Chemical Identifier Resolver fallback. This is especially useful
+    # for chemical synonyms that are present in chemical-name databases but are
+    # not indexed as an exact PubChem compound-name query, e.g.
+    # "5-bromonaproxen" / "5-bromo naproxen".
+    cir_candidates = []
+    for candidate in (parsed.raw, normalized, compact):
+        if candidate and candidate.lower() not in {c.lower() for c in cir_candidates}:
+            cir_candidates.append(candidate)
+    for candidate in cir_candidates:
+        smiles = await pubchem_client.resolve_via_cir(candidate)
+        if smiles:
+            return smiles, f"Resolved via NCI/CADD Chemical Identifier Resolver."
 
     # Final local fallback catches simple SMILES such as CCO/CCC.
     mol = Chem.MolFromSmiles(raw)
