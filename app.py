@@ -60,7 +60,7 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import Enum, auto
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import httpx
 from flask import Flask, request as flask_request
@@ -1424,12 +1424,14 @@ _COEFFICIENT_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s+(.+)$")
 _BARE_FORMULA_RE = re.compile(r"^(?:\([A-Za-z0-9]+\)\d*|[A-Z][a-z]?\d*)+$")
 _SMILES_CHAR_RE = re.compile(r"^[A-Za-z0-9@+\-\[\]\(\)=#$:/\\%.]+$")
 _SMILES_BOND_HINT_RE = re.compile(r"[=#@\[\]\(\)]")
+_CAS_RE = re.compile(r"^\d{2,7}-\d{2}-\d$")
 
 
 class InputKind(Enum):
     NAME = auto()
     SMILES = auto()
     INCHI = auto()
+    CAS = auto()
 
 
 @dataclass(frozen=True)
@@ -1473,14 +1475,97 @@ def parse_coefficient(text: str) -> tuple[Fraction, str]:
     return Fraction(1), raw
 
 
+def is_valid_cas_number(token: str) -> bool:
+    """Validate CAS Registry Number syntax and check digit."""
+    value = token.strip()
+    if not _CAS_RE.fullmatch(value):
+        return False
+    digits = value.replace("-", "")
+    check_digit = int(digits[-1])
+    total = sum(int(d) * weight for weight, d in enumerate(reversed(digits[:-1]), start=1))
+    return total % 10 == check_digit
+
+
+def _split_top_level(text: str, separator: str) -> List[str]:
+    """Split outside SMILES parentheses/brackets."""
+    parts: List[str] = []
+    start = 0
+    paren_depth = 0
+    bracket_depth = 0
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if ch == "[":
+            bracket_depth += 1
+        elif ch == "]" and bracket_depth:
+            bracket_depth -= 1
+        elif bracket_depth == 0:
+            if ch == "(":
+                paren_depth += 1
+            elif ch == ")" and paren_depth:
+                paren_depth -= 1
+            elif paren_depth == 0 and text.startswith(separator, i):
+                parts.append(text[start:i])
+                i += len(separator)
+                start = i
+                continue
+        i += 1
+    parts.append(text[start:])
+    return parts
+
+
 def split_compound_terms(compounds_str: str) -> list[ReactionTerm]:
-    """Split a '+'-joined side while preserving stoichiometric coefficients."""
+    """Split a side on top-level '+' while preserving coefficients and charges."""
     terms: list[ReactionTerm] = []
-    for part in (compounds_str or "").split("+"):
+    for part in _split_top_level(compounds_str or "", "+"):
         coefficient, name = parse_coefficient(part)
         if name:
-            terms.append(ReactionTerm(coefficient, name))
+            terms.append(ReactionTerm(coefficient, name.strip()))
     return terms
+
+
+def find_reaction_separator(text: str) -> Optional[Tuple[str, int]]:
+    """Find reaction '=' or '>>' without confusing SMILES bond '=' with it."""
+    # If the entire input is a valid single SMILES, it is never a reaction.
+    if Chem.MolFromSmiles(text.strip()) is not None:
+        return None
+    if ">>" in text:
+        parts = _split_top_level(text, ">>")
+        if len(parts) == 2 and parts[0].strip() and parts[1].strip():
+            return ">>", text.find(">>")
+        return None
+
+    candidates: List[int] = []
+    paren_depth = 0
+    bracket_depth = 0
+    for i, ch in enumerate(text):
+        if ch == "[":
+            bracket_depth += 1
+        elif ch == "]" and bracket_depth:
+            bracket_depth -= 1
+        elif bracket_depth == 0:
+            if ch == "(":
+                paren_depth += 1
+            elif ch == ")" and paren_depth:
+                paren_depth -= 1
+            elif ch == "=" and paren_depth == 0:
+                left, right = text[:i], text[i + 1:]
+                whitespace_separator = (
+                    i > 0 and i + 1 < len(text)
+                    and text[i - 1].isspace() and text[i + 1].isspace()
+                )
+                reaction_like = "+" in left or "+" in right
+                if whitespace_separator or reaction_like:
+                    candidates.append(i)
+
+    if not candidates:
+        return None
+    # Prefer a whitespace-delimited separator over an '=' embedded in a more
+    # complicated SMILES expression.
+    for idx in candidates:
+        if idx > 0 and idx + 1 < len(text) and text[idx - 1].isspace() and text[idx + 1].isspace():
+            return "=", idx
+    return "=", candidates[-1]
 
 
 def split_compound_list(compounds_str: str) -> List[str]:
@@ -1506,17 +1591,22 @@ def scale_terms_to_integers(*sides: list[ReactionTerm]) -> tuple[int, list[list[
 
 def detect_input_kind(token: str) -> InputKind:
     stripped = token.strip()
+    if is_valid_cas_number(stripped):
+        return InputKind.CAS
     if stripped.upper().startswith("INCHI="):
         return InputKind.INCHI
     if " " not in stripped and _SMILES_CHAR_RE.match(stripped):
         has_digit = any(ch.isdigit() for ch in stripped)
         if _SMILES_BOND_HINT_RE.search(stripped) or has_digit:
             return InputKind.SMILES
+        # CCO / CCC are valid SMILES even without an explicit bond symbol.
+        if Chem.MolFromSmiles(stripped) is not None:
+            return InputKind.SMILES
     return InputKind.NAME
 
 
 def parse_compound(token: str) -> ParsedCompound:
-    return ParsedCompound(raw=token, kind=detect_input_kind(token))
+    return ParsedCompound(raw=token.strip(), kind=detect_input_kind(token))
 
 
 def safe_filename(name: str) -> str:
@@ -1566,6 +1656,9 @@ class PubChemClient:
     async def get_canonical_smiles_by_name(self, name: str) -> Optional[str]:
         return await self._resolve("name", name)
 
+    async def get_canonical_smiles_by_cas(self, cas_number: str) -> Optional[str]:
+        return await self._resolve("name", cas_number)
+
     async def get_canonical_smiles_by_inchi(self, inchi: str) -> Optional[str]:
         return await self._resolve("inchi", inchi)
 
@@ -1577,7 +1670,7 @@ class PubChemClient:
         if self._client is None:
             await self.start()
         encoded = urllib.parse.quote(value.strip(), safe="")
-        url = f"{PUBCHEM_BASE_URL}/compound/{namespace}/{encoded}/property/CanonicalSMILES/TXT"
+        url = f"{PUBCHEM_BASE_URL}/compound/{namespace}/{encoded}/property/IsomericSMILES/TXT"
         async with self._semaphore:
             try:
                 assert self._client is not None
@@ -1666,7 +1759,7 @@ async def resolve_species(token: str) -> tuple[str | None, str]:
     if parsed.kind is InputKind.SMILES:
         mol = Chem.MolFromSmiles(parsed.raw)
         if mol is not None:
-            return Chem.MolToSmiles(mol), ""
+            return Chem.MolToSmiles(mol, isomericSmiles=True), ""
         smiles = await pubchem_client.get_canonical_smiles_by_name(parsed.raw)
         return smiles, ""
 
@@ -1674,16 +1767,32 @@ async def resolve_species(token: str) -> tuple[str | None, str]:
         smiles = await pubchem_client.get_canonical_smiles_by_inchi(parsed.raw)
         return smiles, ""
 
-    # For names, PubChem remains the primary resolver.
+    if parsed.kind is InputKind.CAS:
+        smiles = await pubchem_client.get_canonical_smiles_by_cas(parsed.raw)
+        if smiles:
+            return smiles, f"CAS RN {parsed.raw}"
+        return None, ""
+
+    # PubChem primary lookup, followed by conservative name normalization for
+    # names such as 5-bromonaproxen / 5-bromo naproxen.
     smiles = await pubchem_client.get_canonical_smiles_by_name(parsed.raw)
     if smiles:
         return smiles, ""
+    normalized = re.sub(r"[\s-]+", "-", parsed.raw).strip("-")
+    if normalized.lower() != parsed.raw.lower():
+        smiles = await pubchem_client.get_canonical_smiles_by_name(normalized)
+        if smiles:
+            return smiles, ""
+    compact = re.sub(r"[\s-]+", "", parsed.raw)
+    if compact.lower() != parsed.raw.lower() and compact.lower() != normalized.lower():
+        smiles = await pubchem_client.get_canonical_smiles_by_name(compact)
+        if smiles:
+            return smiles, ""
 
-    # Final local fallback catches simple SMILES such as CCO/CCC that the old
-    # detector intentionally classified as names.
+    # Final local fallback catches simple SMILES such as CCO/CCC.
     mol = Chem.MolFromSmiles(raw)
     if mol is not None:
-        return Chem.MolToSmiles(mol), f"'{raw}' was interpreted as a SMILES string."
+        return Chem.MolToSmiles(mol, isomericSmiles=True), f"'{raw}' was interpreted as a SMILES string."
     return None, ""
 
 
@@ -1904,6 +2013,52 @@ def render_reaction_scheme(reactant_pairs, product_pairs, sub_size=REACTION_SUBI
     return out.getvalue()
 
 
+
+def render_compound_collection(compounds: list[tuple[Fraction, str, str]], size=MOL_IMAGE_SIZE) -> Optional[bytes]:
+    """Render independent compounds joined by '+'; no RXN is created."""
+    from PIL import Image, ImageDraw, ImageFont
+
+    images = []
+    for coefficient, name, smiles in compounds:
+        data = render_molecule(smiles, name, size=size)
+        if not data:
+            continue
+        image = Image.open(io.BytesIO(data)).convert("RGB")
+        # Add coefficient only when it was explicitly supplied and is not 1.
+        if coefficient != 1:
+            font = _layout_font(max(24, size[1] // 7))
+            layer = Image.new("RGB", (image.width + 50, image.height), "white")
+            layer.paste(image, (50, 0))
+            ImageDraw.Draw(layer).text((8, 18), ReactionTerm(coefficient, "").pretty_coefficient, fill=(20, 20, 20), font=font)
+            image = layer
+        images.append(image)
+
+    if not images:
+        return None
+    gap = 30
+    plus_width = 42
+    margin = 20
+    width = sum(img.width for img in images) + gap * (len(images) - 1) + plus_width * (len(images) - 1) + 2 * margin
+    height = max(img.height for img in images) + 2 * margin
+    canvas = Image.new("RGB", (width, height), "white")
+    draw = ImageDraw.Draw(canvas)
+    plus_font = _layout_font(max(28, size[1] // 7))
+    x = margin
+    for i, image in enumerate(images):
+        y = (height - image.height) // 2
+        canvas.paste(image, (x, y))
+        x += image.width
+        if i < len(images) - 1:
+            box = draw.textbbox((0, 0), "+", font=plus_font)
+            tw = box[2] - box[0]
+            th = box[3] - box[1]
+            x += gap // 2
+            draw.text((x + (plus_width - tw) // 2, (height - th) // 2 - box[1]), "+", fill=(20, 20, 20), font=plus_font)
+            x += plus_width + gap // 2
+    out = io.BytesIO()
+    canvas.save(out, format="PNG", optimize=True)
+    return out.getvalue()
+
 def bytes_to_named_bytesio(data: bytes, filename: str) -> io.BytesIO:
     bio = io.BytesIO(data)
     bio.name = filename
@@ -2101,7 +2256,8 @@ WELCOME_TEXT = (
     "I turn compound names, SMILES, or InChI strings into clean 2D structures "
     "and editable files you can open in ChemDraw.\n\n"
     "<b>Single compound</b>\n"
-    "Send a name, SMILES, or InChI directly, e.g. <code>Aspirin</code>\n\n"
+    "Send a name, SMILES, InChI, or CAS RN, e.g. <code>Aspirin</code>, <code>CC(=O)OC1=CC=CC=C1C(=O)O</code>, or <code>50-78-2</code>.\n\n"
+    "You can also send multiple compounds separated by <code>+</code>, e.g. <code>Aspirin + Caffeine</code>.\n\n"
     "<b>Reaction scheme</b>\n"
     "Separate reactants and products with '=' and join multiple compounds with '+'.\n"
     "Examples:\n"
@@ -2111,7 +2267,7 @@ WELCOME_TEXT = (
 )
 NOT_FOUND_TEXT = (
     "⚠️ I couldn't resolve '<code>{name}</code>'.\n"
-    "Double-check the spelling (English names work best), or try a SMILES / InChI string instead."
+    "Double-check the spelling (English names work best), or try a SMILES / InChI / CAS RN instead."
 )
 GENERIC_ERROR_TEXT = "❌ A technical error occurred while processing your request. Please try again."
 PROCESSING_TEXT = "⚙️ Processing your request..."
@@ -2155,101 +2311,113 @@ async def _resolve_terms(terms: list[ReactionTerm]):
 
 
 async def _handle_single_compound(update: Update, status_msg, text: str) -> None:
-    compounds = split_compound_list(text)
-    if not compounds:
+    terms = split_compound_terms(text)
+    if not terms:
         await status_msg.delete()
         return
-    name = compounds[0]
-    smiles = await resolve_compound_to_smiles(name)
-    if not smiles:
-        await status_msg.edit_text(NOT_FOUND_TEXT.format(name=html.escape(name)), parse_mode="HTML")
+
+    # One compound: keep the established PNG + RXN + MOL behavior.
+    if len(terms) == 1:
+        term = terms[0]
+        name = term.name
+        smiles, note = await resolve_species(name)
+        if not smiles:
+            await status_msg.edit_text(NOT_FOUND_TEXT.format(name=html.escape(name)), parse_mode="HTML")
+            return
+
+        image_bytes, rxn_file, mol_file = await asyncio.gather(
+            asyncio.to_thread(render_molecule, smiles, name),
+            asyncio.to_thread(generate_single_rxn_file, smiles, f"{safe_filename(name)}.rxn"),
+            asyncio.to_thread(generate_mol_file, smiles, f"{safe_filename(name)}.mol"),
+        )
+        if image_bytes:
+            photo = bytes_to_named_bytesio(image_bytes, f"{safe_filename(name)}.png")
+            caption = f"<b>{html.escape(name)}</b>\n<code>{html.escape(smiles)}</code>"
+            if note:
+                caption += f"\nℹ️ {html.escape(note)}"
+            await update.message.reply_photo(photo=photo, caption=caption, parse_mode="HTML")
+        if rxn_file:
+            await update.message.reply_document(document=rxn_file, caption="Editable reaction file (.rxn)")
+        if mol_file:
+            await update.message.reply_document(document=mol_file, caption="Editable molecule file (.mol)")
+        await status_msg.delete()
         return
 
-    image_bytes, rxn_file, mol_file = await asyncio.gather(
-        asyncio.to_thread(render_molecule, smiles, name),
-        asyncio.to_thread(generate_single_rxn_file, smiles, f"{safe_filename(name)}.rxn"),
-        asyncio.to_thread(generate_mol_file, smiles, f"{safe_filename(name)}.mol"),
-    )
+    # Multiple compounds without a reaction separator: render them together
+    # as a compound collection. They are NOT treated as reactants, so no RXN
+    # is generated.
+    resolved, notes = await _resolve_terms(terms)
+    unresolved = [term.name for term, (_, smiles) in zip(terms, resolved) if smiles is None]
+    if unresolved:
+        joined = ", ".join(html.escape(n) for n in unresolved)
+        await status_msg.edit_text(NOT_FOUND_TEXT.format(name=joined), parse_mode="HTML")
+        return
+
+    collection = [(coef, term.name, smiles) for term, (coef, smiles) in zip(terms, resolved)]
+    image_bytes = await asyncio.to_thread(render_compound_collection, collection)
     if image_bytes:
-        photo = bytes_to_named_bytesio(image_bytes, f"{safe_filename(name)}.png")
-        await update.message.reply_photo(
-            photo=photo,
-            caption=f"<b>{html.escape(name)}</b>\n<code>{html.escape(smiles)}</code>",
-            parse_mode="HTML",
-        )
-    if rxn_file:
-        await update.message.reply_document(document=rxn_file, caption="Editable reaction file (.rxn)")
-    if mol_file:
-        await update.message.reply_document(document=mol_file, caption="Editable molecule file (.mol)")
+        photo = bytes_to_named_bytesio(image_bytes, "Compounds.png")
+        caption = "Compounds:"
+        if notes:
+            caption += "\n" + "\n".join("ℹ️ " + html.escape(n) for n in notes[:3])
+        await update.message.reply_photo(photo=photo, caption=caption, parse_mode="HTML")
+
+    for term, (_, smiles) in zip(terms, resolved):
+        mol_file = await asyncio.to_thread(generate_mol_file, smiles, f"{safe_filename(term.name)}.mol")
+        if mol_file:
+            await update.message.reply_document(document=mol_file, caption=f"Editable molecule: {term.name}")
     await status_msg.delete()
 
 
-async def _handle_reaction(update: Update, status_msg, text: str) -> None:
-    parts = text.split("=")
-    if len(parts) != 2:
-        await status_msg.edit_text("⚠️ Please use exactly one '=' sign to separate reactants and products.")
-        return
+async def _handle_reaction(update: Update, status_msg, text: str, separator: str, index: int) -> None:
+    if separator == ">>":
+        left, right = text.split(">>", 1)
+    else:
+        left, right = text[:index], text[index + 1:]
 
-    reactant_terms = split_compound_terms(parts[0])
-    product_terms = split_compound_terms(parts[1])
+    reactant_terms = split_compound_terms(left)
+    product_terms = split_compound_terms(right)
     if not reactant_terms or not product_terms:
         await status_msg.edit_text("⚠️ Please provide at least one compound on each side of the reaction.")
         return
 
     reactant_resolved, reactant_notes = await _resolve_terms(reactant_terms)
     product_resolved, product_notes = await _resolve_terms(product_terms)
-    unresolved = []
-    for term, (coefficient, smiles) in zip(reactant_terms, reactant_resolved):
-        if smiles is None:
-            unresolved.append(term.name)
-    for term, (coefficient, smiles) in zip(product_terms, product_resolved):
-        if smiles is None:
-            unresolved.append(term.name)
+    unresolved = [term.name for term, (_, smiles) in zip(reactant_terms, reactant_resolved) if smiles is None]
+    unresolved += [term.name for term, (_, smiles) in zip(product_terms, product_resolved) if smiles is None]
     if unresolved:
-        joined = ", ".join(html.escape(n) for n in unresolved)
+        joined = ", ".join(html.escape(n) for n in dict.fromkeys(unresolved))
         await status_msg.edit_text(NOT_FOUND_TEXT.format(name=joined), parse_mode="HTML")
         return
 
     reactant_pairs = [(coef, smiles) for coef, smiles in reactant_resolved]
     product_pairs = [(coef, smiles) for coef, smiles in product_resolved]
-
     balance = check_reaction_balance(reactant_pairs, product_pairs)
     equation = format_equation(reactant_terms, product_terms)
-    rxn_title = equation
 
     scheme_bytes, rxn_file = await asyncio.gather(
         asyncio.to_thread(render_reaction_scheme, reactant_pairs, product_pairs),
-        # generate_rxn_file expects ReactionTerm objects so it can preserve
-        # and exactly scale stoichiometric coefficients (including fractions).
         asyncio.to_thread(
             generate_rxn_file,
             [ReactionTerm(coef, smiles) for coef, smiles in reactant_pairs],
             [ReactionTerm(coef, smiles) for coef, smiles in product_pairs],
             "Reaction.rxn",
-            rxn_title,
+            equation,
         ),
     )
 
     caption_lines = ["Reaction scheme:", f"<code>{html.escape(equation)}</code>"]
     if balance.get("checked"):
         caption_lines.append(html.escape(balance["message"]))
-    if reactant_notes or product_notes:
-        # Keep ambiguity explanations short and visible without blocking the drawing.
-        for note in (reactant_notes + product_notes)[:3]:
-            caption_lines.append("ℹ️ " + html.escape(note))
+    for note in (reactant_notes + product_notes)[:3]:
+        caption_lines.append("ℹ️ " + html.escape(note))
     caption = "\n".join(caption_lines)
 
     if scheme_bytes:
         photo = bytes_to_named_bytesio(scheme_bytes, "Reaction.png")
         await update.message.reply_photo(photo=photo, caption=caption, parse_mode="HTML")
-    else:
-        chem_logger.warning("Reaction PNG rendering failed for %s", equation)
-
     if rxn_file:
         await update.message.reply_document(document=rxn_file, caption="Editable reaction file (.rxn)")
-    else:
-        chem_logger.warning("Reaction RXN generation failed for %s", equation)
-
     await status_msg.delete()
 
 
@@ -2261,8 +2429,10 @@ async def handle_chemical_message(update: Update, context: ContextTypes.DEFAULT_
     asyncio.create_task(notify_admin(update, context))
     status_msg = await update.message.reply_text(PROCESSING_TEXT)
     try:
-        if "=" in text:
-            await _handle_reaction(update, status_msg, text)
+        separator_info = find_reaction_separator(text)
+        if separator_info:
+            separator, index = separator_info
+            await _handle_reaction(update, status_msg, text, separator, index)
         else:
             await _handle_single_compound(update, status_msg, text)
     except Exception as exc:
