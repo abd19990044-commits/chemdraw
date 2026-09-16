@@ -41,15 +41,10 @@ def _prepare_mol(smiles: str) -> Chem.Mol | None:
         return None
     mol = Chem.Mol(mol)
     Chem.AssignStereochemistry(mol, cleanIt=True, force=True)
-
-    # ChemDraw does not reliably display MDL/CDXML aromatic Order=1.5 bonds as
-    # alternating double bonds.  Export an explicit Kekule form while keeping
-    # the source molecule and publication PNG renderer unchanged.
     try:
         Chem.Kekulize(mol, clearAromaticFlags=True)
     except Exception:
         pass
-
     rdDepictor.Compute2DCoords(mol, canonOrient=True, clearConfs=True)
     try:
         rdDepictor.StraightenDepiction(mol, minimizeRotation=True)
@@ -83,11 +78,7 @@ def _bond_order_value(bond: Chem.Bond) -> str:
 
 
 def _add_text(page: ET.Element, obj_id: int, x: float, y: float, text: str, size: float = TEXT_SIZE, bold: bool = False) -> int:
-    t = ET.SubElement(page, "t", {
-        "id": str(obj_id),
-        "p": f"{x:.2f} {y:.2f}",
-        "Justification": "Center",
-    })
+    t = ET.SubElement(page, "t", {"id": str(obj_id), "p": f"{x:.2f} {y:.2f}", "Justification": "Center"})
     s_attrs = {"font": "3", "size": f"{float(size):g}"}
     if bold:
         s_attrs["face"] = "1"
@@ -97,11 +88,7 @@ def _add_text(page: ET.Element, obj_id: int, x: float, y: float, text: str, size
 
 
 def _add_plain_line(page: ET.Element, obj_id: int, x1: float, y1: float, x2: float, y2: float) -> int:
-    ET.SubElement(page, "graphic", {
-        "id": str(obj_id),
-        "GraphicType": "Line",
-        "BoundingBox": f"{x1:.2f} {y1:.2f} {x2:.2f} {y2:.2f}",
-    })
+    ET.SubElement(page, "graphic", {"id": str(obj_id), "GraphicType": "Line", "BoundingBox": f"{x1:.2f} {y1:.2f} {x2:.2f} {y2:.2f}"})
     return obj_id + 1
 
 
@@ -112,7 +99,6 @@ def _add_fragment(page: ET.Element, obj_id: int, mol: Chem.Mol, x0: float, cente
     obj_id += 1
     conf = mol.GetConformer()
     atom_ids: dict[int, int] = {}
-
     for i, atom in enumerate(mol.GetAtoms()):
         p = conf.GetAtomPosition(i)
         x = x0 + (p.x - minx) * BOND_LENGTH
@@ -130,14 +116,8 @@ def _add_fragment(page: ET.Element, obj_id: int, mol: Chem.Mol, x0: float, cente
         ET.SubElement(frag, "n", attrs)
         atom_ids[i] = obj_id
         obj_id += 1
-
     for bond in mol.GetBonds():
-        attrs = {
-            "id": str(obj_id),
-            "B": str(atom_ids[bond.GetBeginAtomIdx()]),
-            "E": str(atom_ids[bond.GetEndAtomIdx()]),
-            "Order": _bond_order_value(bond),
-        }
+        attrs = {"id": str(obj_id), "B": str(atom_ids[bond.GetBeginAtomIdx()]), "E": str(atom_ids[bond.GetEndAtomIdx()]), "Order": _bond_order_value(bond)}
         direction = bond.GetBondDir()
         if direction == Chem.BondDir.BEGINWEDGE:
             attrs["Display"] = "WedgeBegin"
@@ -149,8 +129,39 @@ def _add_fragment(page: ET.Element, obj_id: int, mol: Chem.Mol, x0: float, cente
             attrs["Display"] = "WedgedHashEnd"
         ET.SubElement(frag, "b", attrs)
         obj_id += 1
-
     return obj_id, width
+
+
+def _new_cdxml_root(width: float, height: float) -> tuple[ET.Element, ET.Element]:
+    root = ET.Element("CDXML", {
+        "BoundingBox": f"0 0 {width:.0f} {height:.0f}",
+        "BondLength": f"{BOND_LENGTH:g}",
+        "LabelFont": "3", "LabelSize": f"{LABEL_SIZE:g}",
+        "CaptionFont": "3", "CaptionSize": f"{CAPTION_SIZE:g}",
+        "LineWidth": "0.6", "BoldWidth": "2", "HashSpacing": "2.5", "MarginWidth": "1.6",
+    })
+    colors = ET.SubElement(root, "colortable")
+    ET.SubElement(colors, "color", {"r": "1", "g": "1", "b": "1"})
+    ET.SubElement(colors, "color", {"r": "0", "g": "0", "b": "0"})
+    fonts = ET.SubElement(root, "fonttable")
+    ET.SubElement(fonts, "font", {"id": "3", "charset": "unicode", "name": "Arial"})
+    page = ET.SubElement(root, "page", {"id": "1", "BoundingBox": f"0 0 {width:.0f} {height:.0f}", "Width": f"{width:.0f}", "Height": f"{height:.0f}"})
+    return root, page
+
+
+def generate_single_compound_cdxml(smiles: str, title: str = "Compound") -> bytes | None:
+    mol = _prepare_mol(smiles)
+    if mol is None:
+        return None
+    minx, maxx, miny, maxy = _mol_extent(mol)
+    mol_w = max((maxx - minx) * BOND_LENGTH, BOND_LENGTH)
+    mol_h = max((maxy - miny) * BOND_LENGTH, BOND_LENGTH)
+    width = max(240.0, mol_w + 2 * PAGE_MARGIN)
+    height = max(180.0, mol_h + 2 * PAGE_MARGIN)
+    root, page = _new_cdxml_root(width, height)
+    x0 = (width - mol_w) / 2.0
+    _add_fragment(page, 2, mol, x0, height / 2.0)
+    return ET.tostring(root, encoding="utf-8", xml_declaration=True)
 
 
 def _text_width(text: str) -> float:
@@ -164,7 +175,6 @@ def _add_formula_or_condensed(page: ET.Element, obj_id: int, x0: float, center_y
         width = _text_width(shown)
         obj_id = _add_text(page, obj_id, x0 + width / 2, center_y + 3, shown, size=10)
         return obj_id, width
-
     x = x0
     for kind, token in parts:
         if kind == "group":
@@ -173,18 +183,11 @@ def _add_formula_or_condensed(page: ET.Element, obj_id: int, x0: float, center_y
             obj_id = _add_text(page, obj_id, x + width / 2, center_y + 3, shown, size=10)
             x += width
             continue
-
         bond_width = 16.0
         x1, x2 = x + 2.0, x + bond_width - 2.0
-        if token == "-":
-            obj_id = _add_plain_line(page, obj_id, x1, center_y, x2, center_y)
-        elif token == "=":
-            obj_id = _add_plain_line(page, obj_id, x1, center_y - 1.8, x2, center_y - 1.8)
-            obj_id = _add_plain_line(page, obj_id, x1, center_y + 1.8, x2, center_y + 1.8)
-        else:
-            obj_id = _add_plain_line(page, obj_id, x1, center_y - 2.5, x2, center_y - 2.5)
-            obj_id = _add_plain_line(page, obj_id, x1, center_y, x2, center_y)
-            obj_id = _add_plain_line(page, obj_id, x1, center_y + 2.5, x2, center_y + 2.5)
+        offsets = {"-": [0.0], "=": [-1.8, 1.8], "#": [-2.5, 0.0, 2.5]}[token]
+        for dy in offsets:
+            obj_id = _add_plain_line(page, obj_id, x1, center_y + dy, x2, center_y + dy)
         x += bond_width
     return obj_id, x - x0
 
@@ -198,16 +201,7 @@ def _display_label(smiles: str, small_as_formula: bool) -> str | None:
     return pub2.base.formula_for_display(smiles)
 
 
-def generate_reaction_cdxml(
-    reactant_pairs,
-    product_pairs,
-    *,
-    arrow_top: str = "",
-    arrow_bottom: str = "",
-    arrow_style: str = "forward",
-    title: str = "Reaction",
-    small_as_formula: bool = True,
-) -> bytes | None:
+def generate_reaction_cdxml(reactant_pairs, product_pairs, *, arrow_top: str = "", arrow_bottom: str = "", arrow_style: str = "forward", title: str = "Reaction", small_as_formula: bool = True) -> bytes | None:
     def prepare_side(pairs):
         out = []
         for coef, smiles in pairs:
@@ -220,34 +214,12 @@ def generate_reaction_cdxml(
                     return None
                 out.append((Fraction(coef), "mol", mol))
         return out
-
     reactants = prepare_side(reactant_pairs)
     products = prepare_side(product_pairs)
     if not reactants or not products:
         return None
-
-    root = ET.Element("CDXML", {
-        "BoundingBox": "0 0 800 260",
-        "BondLength": f"{BOND_LENGTH:g}",
-        "LabelFont": "3",
-        "LabelSize": f"{LABEL_SIZE:g}",
-        "CaptionFont": "3",
-        "CaptionSize": f"{CAPTION_SIZE:g}",
-        "LineWidth": "0.6",
-        "BoldWidth": "2",
-        "HashSpacing": "2.5",
-        "MarginWidth": "1.6",
-    })
-
-    color_table = ET.SubElement(root, "colortable")
-    ET.SubElement(color_table, "color", {"r": "1", "g": "1", "b": "1"})
-    ET.SubElement(color_table, "color", {"r": "0", "g": "0", "b": "0"})
-    font_table = ET.SubElement(root, "fonttable")
-    ET.SubElement(font_table, "font", {"id": "3", "charset": "unicode", "name": "Arial"})
-    page = ET.SubElement(root, "page", {"id": "1", "BoundingBox": "0 0 800 260", "Width": "800", "Height": "260"})
-
+    root, page = _new_cdxml_root(800, 260)
     obj_id = 2
-
     def add_side(items, x_start: float) -> float:
         nonlocal obj_id
         xcur = x_start
@@ -266,19 +238,9 @@ def generate_reaction_cdxml(
                 obj_id = _add_text(page, obj_id, xcur, BASELINE_Y + 3, "+", size=11)
                 xcur += PLUS_GAP
         return xcur
-
-    x = add_side(reactants, PAGE_MARGIN)
-    x += MOL_GAP
-    arrow_x1, arrow_x2 = x, x + ARROW_WIDTH
-    arrow_y = BASELINE_Y
-
-    graphic_attrs = {
-        "id": str(obj_id),
-        "GraphicType": "Line",
-        "BoundingBox": f"{arrow_x2:.2f} {arrow_y:.2f} {arrow_x1:.2f} {arrow_y:.2f}",
-        "ArrowType": "FullHead",
-        "HeadSize": "750",
-    }
+    x = add_side(reactants, PAGE_MARGIN) + MOL_GAP
+    arrow_x1, arrow_x2, arrow_y = x, x + ARROW_WIDTH, BASELINE_Y
+    graphic_attrs = {"id": str(obj_id), "GraphicType": "Line", "BoundingBox": f"{arrow_x2:.2f} {arrow_y:.2f} {arrow_x1:.2f} {arrow_y:.2f}", "ArrowType": "FullHead", "HeadSize": "750"}
     if arrow_style == "equilibrium":
         graphic_attrs["ArrowType"] = "Equilibrium"
     elif arrow_style == "reversible":
@@ -286,12 +248,10 @@ def generate_reaction_cdxml(
         graphic_attrs["ArrowheadTail"] = "Full"
     ET.SubElement(page, "graphic", graphic_attrs)
     obj_id += 1
-
     if arrow_top:
         obj_id = _add_text(page, obj_id, (arrow_x1 + arrow_x2) / 2, arrow_y - 18, arrow_top, size=10)
     if arrow_bottom:
         obj_id = _add_text(page, obj_id, (arrow_x1 + arrow_x2) / 2, arrow_y + 20, arrow_bottom, size=10)
-
     x = add_side(products, arrow_x2 + MOL_GAP)
     page_width = max(420, x + PAGE_MARGIN)
     page.set("BoundingBox", f"0 0 {page_width:.0f} 220")
