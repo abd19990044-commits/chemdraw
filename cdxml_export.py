@@ -41,6 +41,15 @@ def _prepare_mol(smiles: str) -> Chem.Mol | None:
         return None
     mol = Chem.Mol(mol)
     Chem.AssignStereochemistry(mol, cleanIt=True, force=True)
+
+    # ChemDraw does not reliably display MDL/CDXML aromatic Order=1.5 bonds as
+    # alternating double bonds.  Export an explicit Kekule form while keeping
+    # the source molecule and publication PNG renderer unchanged.
+    try:
+        Chem.Kekulize(mol, clearAromaticFlags=True)
+    except Exception:
+        pass
+
     rdDepictor.Compute2DCoords(mol, canonOrient=True, clearConfs=True)
     try:
         rdDepictor.StraightenDepiction(mol, minimizeRotation=True)
@@ -263,8 +272,6 @@ def generate_reaction_cdxml(
     arrow_x1, arrow_x2 = x, x + ARROW_WIDTH
     arrow_y = BASELINE_Y
 
-    # ChemDraw places the FullHead at the first point in a Line BoundingBox.
-    # Therefore store the right-hand point first for a left-to-right reaction.
     graphic_attrs = {
         "id": str(obj_id),
         "GraphicType": "Line",
