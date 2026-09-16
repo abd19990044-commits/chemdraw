@@ -1,4 +1,4 @@
-from advanced_chemistry import (
+from advanced_chemistry_v2 import (
     balance_redox,
     conservative_atom_map,
     format_net_ionic,
