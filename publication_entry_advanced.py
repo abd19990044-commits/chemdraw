@@ -16,6 +16,7 @@ from telegram.ext import Application, CallbackQueryHandler, CommandHandler, Mess
 import advanced_chemistry_v2 as adv
 import chemistry_ui as ui
 import publication_entry_balanced as base
+import render_capacity as capacity
 import rxn_export
 
 
@@ -123,7 +124,13 @@ def install_publication_renderer(app_module) -> None:
             return True
 
         if action == "atom_map":
-            mapped = adv.conservative_atom_map(reactant_smiles, product_smiles)
+            if not capacity.try_reserve():
+                await query.message.reply_text("⏳ The free server is busy with chemistry jobs. Please retry atom mapping shortly.")
+                return True
+            try:
+                mapped = await capacity.run_heavy(adv.conservative_atom_map, reactant_smiles, product_smiles)
+            finally:
+                capacity.release()
             if mapped is None:
                 await query.message.reply_text(
                     "⚠️ Conservative atom mapping was not applied. It currently requires a one-reactant → one-product reaction with a unique maximum common substructure."
@@ -171,7 +178,14 @@ def install_publication_renderer(app_module) -> None:
                 return
         else:
             smiles, arrows = payload, []
-        svg = await asyncio.to_thread(adv.render_mechanism_svg, smiles, arrows)
+
+        if not capacity.try_reserve():
+            await update.message.reply_text("⏳ The free server is busy with chemistry jobs. Please retry the mechanism shortly.")
+            return
+        try:
+            svg = await capacity.run_heavy(adv.render_mechanism_svg, smiles, arrows)
+        finally:
+            capacity.release()
         if svg is None:
             await update.message.reply_text("⚠️ The mechanism structure or atom indices could not be interpreted.")
             return
@@ -202,7 +216,7 @@ def install_publication_renderer(app_module) -> None:
         application.add_handler(CallbackQueryHandler(settings_callback, pattern=r"^chem:"))
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, app_module.handle_chemical_message))
         application.add_error_handler(app_module.error_handler)
-        app_module.chem_logger.info("Advanced Chemistry UI enabled: redox, net ionic, atom mapping, mechanisms.")
+        app_module.chem_logger.info("Advanced Chemistry UI enabled with bounded heavy-work executor: %s", capacity.capacity_snapshot())
         application.run_polling(
             allowed_updates=Update.ALL_TYPES,
             drop_pending_updates=True,
@@ -213,5 +227,5 @@ def install_publication_renderer(app_module) -> None:
     app_module.chem_start_command = advanced_start
     app_module.run_chem_bot = run_chem_bot_advanced
     app_module.chem_logger.info(
-        "Advanced chemistry engine installed; final balanced reaction state is reused by advanced tools without modifying ORCA/Flask."
+        "Advanced chemistry engine installed; final balanced state and bounded Render-free worker are active without modifying ORCA/Flask."
     )
