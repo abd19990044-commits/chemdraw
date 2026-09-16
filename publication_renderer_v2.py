@@ -6,9 +6,14 @@ Focused visual refinement layer over :mod:`publication_renderer`.
 It keeps the established parser/RDKit machinery while improving manuscript
 layout and using condensed structural formulae for very small organic species
 whose skeletal depiction would otherwise be visually ambiguous.
+
+Condensed structural formulae are rendered chemically: bond symbols are not
+font glyphs. Single, double and triple bonds are drawn as real vector/raster
+lines aligned to the centres of the adjacent atom/group labels.
 """
 
 import io
+import re
 from fractions import Fraction
 from xml.sax.saxutils import escape
 
@@ -20,16 +25,18 @@ import publication_renderer as base
 RENDER_DPI = 600
 DEFAULT_BOND_PX = 62.0
 DEFAULT_FONT_PX = 42
-DEFAULT_GAP_PX = 24
-DEFAULT_ARROW_PX = 240
+DEFAULT_GAP_PX = 23
+DEFAULT_ARROW_PX = 216
 INK = base.INK
 WHITE = base.WHITE
 
 # Only species whose line-angle representation becomes uninformative at this
 # scale belong here. Larger molecules remain full RDKit skeletal structures.
+# ASCII bond markers are intentional; the renderer converts them into actual
+# drawn bonds, so they never appear as typographic '-'/'=' characters.
 _CONDENSED_SMALL_ORGANICS = {
     "C=C": "CH2=CH2",          # ethene
-    "CC": "CH3–CH3",           # ethane
+    "CC": "CH3-CH3",           # ethane
     "CO": "CH3OH",             # methanol
     "C=O": "H2C=O",            # formaldehyde
     "CCO": "CH3CH2OH",         # ethanol
@@ -52,13 +59,16 @@ def _canonical_text_table(source: dict[str, str]) -> dict[str, str]:
 _CONDENSED_BY_CANONICAL_SMILES = _canonical_text_table(_CONDENSED_SMALL_ORGANICS)
 
 
-def formula_for_display(smiles: str) -> str | None:
-    """Prefer condensed structural text for tiny organics, then base rules."""
+def _condensed_for_display(smiles: str) -> str | None:
     mol = Chem.MolFromSmiles(smiles or "")
     if mol is None:
         return None
-    canonical = Chem.MolToSmiles(mol)
-    condensed = _CONDENSED_BY_CANONICAL_SMILES.get(canonical)
+    return _CONDENSED_BY_CANONICAL_SMILES.get(Chem.MolToSmiles(mol))
+
+
+def formula_for_display(smiles: str) -> str | None:
+    """Prefer condensed structural text for tiny organics, then base rules."""
+    condensed = _condensed_for_display(smiles)
     if condensed:
         return condensed
     return base.formula_for_display(smiles)
@@ -87,9 +97,125 @@ def _build_tokens(reactant_pairs, product_pairs, small_as_formula: bool):
             coef = Fraction(coefficient)
             if coef != 1:
                 tokens.append(("coef", str(coef.numerator) if coef.denominator == 1 else str(coef)))
-            formula = formula_for_display(smiles) if small_as_formula else None
+            condensed = _condensed_for_display(smiles) if small_as_formula else None
+            if condensed:
+                tokens.append(("condensed", condensed))
+                continue
+            formula = base.formula_for_display(smiles) if small_as_formula else None
             tokens.append(("formula" if formula else "mol", formula or smiles))
     return tokens
+
+
+_BOND_SPLIT_RE = re.compile(r"([=#-])")
+
+
+def _split_condensed(text: str) -> list[tuple[str, str]]:
+    """Return alternating ('group', text) / ('bond', symbol) elements."""
+    parts = [p for p in _BOND_SPLIT_RE.split(text or "") if p]
+    out: list[tuple[str, str]] = []
+    for part in parts:
+        out.append(("bond" if part in {"-", "=", "#"} else "group", part))
+    return out
+
+
+def _condensed_png(text: str, font_size: int = DEFAULT_FONT_PX) -> Image.Image:
+    elements = _split_condensed(text)
+    group_images: dict[int, Image.Image] = {}
+    bond_width = max(34, int(font_size * 0.92))
+    bond_pad = max(4, int(font_size * 0.10))
+    total_w = 0
+    max_h = 0
+
+    for i, (kind, value) in enumerate(elements):
+        if kind == "group":
+            img = base._formula_png(value, font_size)
+            group_images[i] = img
+            total_w += img.width
+            max_h = max(max_h, img.height)
+        else:
+            total_w += bond_width + 2 * bond_pad
+
+    pad_x = max(8, font_size // 5)
+    pad_y = max(8, font_size // 5)
+    canvas = Image.new("RGB", (total_w + 2 * pad_x, max_h + 2 * pad_y), WHITE)
+    draw = ImageDraw.Draw(canvas)
+    center_y = canvas.height // 2
+    x = pad_x
+
+    for i, (kind, value) in enumerate(elements):
+        if kind == "group":
+            img = group_images[i]
+            canvas.paste(img, (x, center_y - img.height // 2))
+            x += img.width
+            continue
+
+        x1 = x + bond_pad
+        x2 = x1 + bond_width
+        line_w = 3
+        if value == "-":
+            draw.line((x1, center_y, x2, center_y), fill=INK, width=line_w)
+        elif value == "=":
+            offset = max(4, int(font_size * 0.11))
+            draw.line((x1, center_y - offset, x2, center_y - offset), fill=INK, width=line_w)
+            draw.line((x1, center_y + offset, x2, center_y + offset), fill=INK, width=line_w)
+        else:  # triple bond
+            offset = max(5, int(font_size * 0.13))
+            draw.line((x1, center_y - offset, x2, center_y - offset), fill=INK, width=line_w)
+            draw.line((x1, center_y, x2, center_y), fill=INK, width=line_w)
+            draw.line((x1, center_y + offset, x2, center_y + offset), fill=INK, width=line_w)
+        x += bond_width + 2 * bond_pad
+
+    return base._trim(canvas, 4)
+
+
+def _svg_group(text: str, x: int, y: int, font_size: int) -> str:
+    return _svg_formula(text, x, y, font_size)
+
+
+def _condensed_svg(text: str, x: int, cy: int, font_size: int = DEFAULT_FONT_PX) -> tuple[str, int, int]:
+    elements = _split_condensed(text)
+    bond_width = max(34, int(font_size * 0.92))
+    bond_pad = max(4, int(font_size * 0.10))
+
+    # Approximate text widths to match the SVG typography closely enough for
+    # stable layout. Formula groups are deliberately conservative in width.
+    def group_width(group: str) -> int:
+        normal = sum(1 for c in group if not c.isdigit())
+        subs = sum(1 for c in group if c.isdigit())
+        return max(36, int(normal * font_size * 0.60 + subs * font_size * 0.42 + 8))
+
+    widths: list[int] = []
+    total = 0
+    for kind, value in elements:
+        w = group_width(value) if kind == "group" else bond_width + 2 * bond_pad
+        widths.append(w)
+        total += w
+
+    out: list[str] = []
+    px = x
+    baseline = cy + int(font_size * 0.32)
+    for (kind, value), w in zip(elements, widths):
+        if kind == "group":
+            out.append(_svg_group(value, px, baseline, font_size))
+            px += w
+            continue
+
+        x1 = px + bond_pad
+        x2 = x1 + bond_width
+        if value == "-":
+            out.append(f'<line x1="{x1}" y1="{cy}" x2="{x2}" y2="{cy}" stroke="#141414" stroke-width="3" stroke-linecap="round"/>')
+        elif value == "=":
+            offset = max(4, int(font_size * 0.11))
+            out.append(f'<line x1="{x1}" y1="{cy-offset}" x2="{x2}" y2="{cy-offset}" stroke="#141414" stroke-width="3" stroke-linecap="round"/>')
+            out.append(f'<line x1="{x1}" y1="{cy+offset}" x2="{x2}" y2="{cy+offset}" stroke="#141414" stroke-width="3" stroke-linecap="round"/>')
+        else:
+            offset = max(5, int(font_size * 0.13))
+            out.append(f'<line x1="{x1}" y1="{cy-offset}" x2="{x2}" y2="{cy-offset}" stroke="#141414" stroke-width="3" stroke-linecap="round"/>')
+            out.append(f'<line x1="{x1}" y1="{cy}" x2="{x2}" y2="{cy}" stroke="#141414" stroke-width="3" stroke-linecap="round"/>')
+            out.append(f'<line x1="{x1}" y1="{cy+offset}" x2="{x2}" y2="{cy+offset}" stroke="#141414" stroke-width="3" stroke-linecap="round"/>')
+        px += w
+
+    return "".join(out), total, max(58, int(font_size * 1.45))
 
 
 def render_reaction_png(
@@ -101,7 +227,7 @@ def render_reaction_png(
     arrow_bottom: str = "",
     dpi: int = RENDER_DPI,
 ) -> bytes | None:
-    """Render a compact publication PNG with balanced visual proportions."""
+    """Render a compact publication PNG with chemically drawn condensed bonds."""
     tokens = _build_tokens(reactant_pairs, product_pairs, small_as_formula)
     if not tokens:
         return None
@@ -110,13 +236,16 @@ def render_reaction_png(
     font = base._load_font(DEFAULT_FONT_PX)
     probe = ImageDraw.Draw(Image.new("RGB", (1, 1)))
     ann_w = max(base._annotation_width(arrow_top), base._annotation_width(arrow_bottom))
-    arrow_w = max(DEFAULT_ARROW_PX, ann_w + 80)
+    arrow_w = max(DEFAULT_ARROW_PX, ann_w + 72)
 
     for kind, payload in tokens:
         if kind == "mol":
             image = _molecule_png(str(payload))
             if image is None:
                 return None
+            rendered.append((kind, image, image.width, image.height))
+        elif kind == "condensed":
+            image = _condensed_png(str(payload), DEFAULT_FONT_PX)
             rendered.append((kind, image, image.width, image.height))
         elif kind == "formula":
             image = base._formula_png(str(payload), DEFAULT_FONT_PX)
@@ -128,25 +257,25 @@ def render_reaction_png(
             rendered.append((kind, None, arrow_w, 28))
 
     gap = DEFAULT_GAP_PX
-    margin_x = 42
-    label_room_top = 48 if arrow_top else 0
-    label_room_bottom = 46 if arrow_bottom else 0
-    chemistry_h = max((h for _, _, _, h in rendered), default=110)
+    margin_x = 40
+    label_room_top = 46 if arrow_top else 0
+    label_room_bottom = 43 if arrow_bottom else 0
+    chemistry_h = max((h for _, _, _, h in rendered), default=108)
     width = sum(w for _, _, w, _ in rendered) + gap * (len(rendered) - 1) + 2 * margin_x
-    height = chemistry_h + label_room_top + label_room_bottom + 58
+    height = chemistry_h + label_room_top + label_room_bottom + 54
 
     canvas = Image.new("RGB", (max(1, width), max(1, height)), WHITE)
     draw = ImageDraw.Draw(canvas)
-    center_y = label_room_top + 29 + chemistry_h // 2
+    center_y = label_room_top + 27 + chemistry_h // 2
     x = margin_x
 
     for kind, payload, w, h in rendered:
-        if kind in {"mol", "formula"}:
+        if kind in {"mol", "formula", "condensed"}:
             image = payload
             canvas.paste(image, (x, center_y - image.height // 2))
         elif kind == "arrow":
             y = center_y
-            head = 17
+            head = 16
             draw.line((x, y, x + w - head, y), fill=INK, width=3)
             draw.polygon(
                 [(x + w, y), (x + w - head, y - 7), (x + w - head, y + 7)],
@@ -154,9 +283,9 @@ def render_reaction_png(
             )
             cx = x + w // 2
             if arrow_top:
-                base._draw_annotation(draw, cx, y - 17, arrow_top, font_size=29)
+                base._draw_annotation(draw, cx, y - 16, arrow_top, font_size=29)
             if arrow_bottom:
-                base._draw_annotation(draw, cx, y + 43, arrow_bottom, font_size=29)
+                base._draw_annotation(draw, cx, y + 40, arrow_bottom, font_size=29)
         else:
             box = draw.textbbox((0, 0), str(payload), font=font)
             draw.text(
@@ -201,14 +330,14 @@ def render_reaction_svg(
     arrow_top: str = "",
     arrow_bottom: str = "",
 ) -> bytes | None:
-    """Render the same compact layout as true vector SVG."""
+    """Render the compact layout as true vector SVG, including internal bonds."""
     tokens = _build_tokens(reactant_pairs, product_pairs, small_as_formula)
     if not tokens:
         return None
 
     items: list[tuple[str, object, int, int]] = []
     ann_w = max(len(arrow_top), len(arrow_bottom)) * 15
-    arrow_w = max(DEFAULT_ARROW_PX, ann_w + 80)
+    arrow_w = max(DEFAULT_ARROW_PX, ann_w + 72)
 
     for kind, payload in tokens:
         if kind == "mol":
@@ -216,6 +345,13 @@ def render_reaction_svg(
             if frag is None:
                 return None
             items.append((kind, frag, frag[1], frag[2]))
+        elif kind == "condensed":
+            # placeholder dimensions; actual fragment is positioned once cy is known
+            parts = _split_condensed(str(payload))
+            approx_w = 0
+            for pk, pv in parts:
+                approx_w += max(36, int(len(pv) * DEFAULT_FONT_PX * 0.48 + 8)) if pk == "group" else max(34, int(DEFAULT_FONT_PX * 0.92)) + 2 * max(4, int(DEFAULT_FONT_PX * 0.10))
+            items.append((kind, payload, approx_w, 62))
         elif kind == "formula":
             w = max(68, len(str(payload)) * 23 + 18)
             items.append((kind, payload, w, 58))
@@ -225,10 +361,10 @@ def render_reaction_svg(
             items.append((kind, None, arrow_w, 28))
 
     gap = DEFAULT_GAP_PX
-    margin = 42
-    top = 56 if arrow_top else 18
-    bottom = 54 if arrow_bottom else 22
-    chemistry_h = max((h for _, _, _, h in items), default=110)
+    margin = 40
+    top = 54 if arrow_top else 18
+    bottom = 50 if arrow_bottom else 22
+    chemistry_h = max((h for _, _, _, h in items), default=108)
     width = sum(w for _, _, w, _ in items) + gap * (len(items) - 1) + 2 * margin
     height = top + chemistry_h + bottom
     cy = top + chemistry_h // 2
@@ -245,6 +381,9 @@ def render_reaction_svg(
         if kind == "mol":
             frag, _, _ = payload
             out.append(f'<g transform="translate({x},{cy - h // 2})">{frag}</g>')
+        elif kind == "condensed":
+            frag, _, _ = _condensed_svg(str(payload), x, cy, DEFAULT_FONT_PX)
+            out.append(frag)
         elif kind == "formula":
             out.append(_svg_formula(str(payload), x + 5, cy + 14))
         elif kind in {"op", "coef"}:
@@ -254,7 +393,7 @@ def render_reaction_svg(
             )
         else:
             end = x + w - 7
-            head = end - 17
+            head = end - 16
             out.append(
                 f'<line x1="{x}" y1="{cy}" x2="{head}" y2="{cy}" '
                 'stroke="#141414" stroke-width="3"/>'
@@ -264,9 +403,9 @@ def render_reaction_svg(
             )
             cx = x + w // 2
             if arrow_top:
-                out.append(base._svg_annotation(arrow_top, cx, cy - 17, font_size=29))
+                out.append(base._svg_annotation(arrow_top, cx, cy - 16, font_size=29))
             if arrow_bottom:
-                out.append(base._svg_annotation(arrow_bottom, cx, cy + 39, font_size=29))
+                out.append(base._svg_annotation(arrow_bottom, cx, cy + 37, font_size=29))
         x += w + gap
 
     out.append("</svg>")
