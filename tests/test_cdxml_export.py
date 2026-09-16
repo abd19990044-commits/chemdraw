@@ -77,3 +77,20 @@ def test_cdxml_preserves_chiral_wedge_or_dash_depiction():
         display in {"WedgeBegin", "WedgedHashBegin", "WedgeEnd", "WedgedHashEnd"}
         for display in displays
     )
+
+
+def test_cdxml_uses_normal_chemdraw_font_scale():
+    data = generate_reaction_cdxml(
+        [(1, "C=C"), (1, "[H][H]")],
+        [(1, "CC")],
+        arrow_top="Ni",
+        arrow_bottom="150 °C",
+    )
+    assert data is not None
+    root = ET.fromstring(data)
+    assert 8 <= float(root.get("LabelSize", "0")) <= 14
+    assert 8 <= float(root.get("CaptionSize", "0")) <= 14
+    sizes = [float(s.get("size", "0")) for s in root.findall("page/t/s")]
+    assert sizes
+    assert max(sizes) <= 14
+    assert min(sizes) >= 8
