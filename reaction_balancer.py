@@ -2,17 +2,23 @@ from __future__ import annotations
 
 """Exact stoichiometric balancing for resolved reaction structures.
 
-The balancer works from RDKit molecular graphs, conserves every element and
-formal charge, and only returns a result when the stoichiometric null space is
-one-dimensional.  Ambiguous/underdetermined reactions are deliberately left
-unchanged rather than guessed.
+The balancer works from RDKit molecular graphs and conserves every element and
+formal charge.  For one-dimensional systems it returns the unique smallest
+positive integer solution.  For modest underdetermined systems it searches the
+exact rational solution space for the smallest all-positive integer solution
+without inventing any species.
 """
 
 from fractions import Fraction
 from functools import reduce
+from itertools import product
 from math import gcd
 
 from rdkit import Chem
+
+
+_MAX_FREE_DIM = 3
+_MAX_FREE_VALUE = 24
 
 
 def _lcm(a: int, b: int) -> int:
@@ -63,39 +69,75 @@ def _rref(matrix: list[list[Fraction]]) -> tuple[list[list[Fraction]], list[int]
     return a, pivots
 
 
-def _one_dimensional_null_vector(matrix: list[list[Fraction]]) -> list[Fraction] | None:
+def _normalize_positive(vec: list[Fraction]) -> list[int] | None:
+    if not vec or any(v <= 0 for v in vec):
+        return None
+    denominator_lcm = reduce(_lcm, (v.denominator for v in vec), 1)
+    ints = [int(v * denominator_lcm) for v in vec]
+    common = reduce(gcd, (abs(v) for v in ints if v), 0) or 1
+    ints = [v // common for v in ints]
+    if not all(v > 0 for v in ints):
+        return None
+    return ints
+
+
+def _smallest_positive_null_vector(matrix: list[list[Fraction]]) -> list[Fraction] | None:
     if not matrix or not matrix[0]:
         return None
     rref, pivots = _rref(matrix)
     n = len(matrix[0])
     free = [c for c in range(n) if c not in pivots]
-    if len(free) != 1:
+    if not free:
         return None
-    f = free[0]
-    x = [Fraction(0) for _ in range(n)]
-    x[f] = Fraction(1)
-    for row_idx in range(len(pivots) - 1, -1, -1):
-        pcol = pivots[row_idx]
-        row = rref[row_idx]
-        x[pcol] = -sum(row[j] * x[j] for j in range(pcol + 1, n))
-    if any(v == 0 for v in x):
+
+    # Unique null-space direction: exact and immediate.
+    if len(free) == 1:
+        f = free[0]
+        x = [Fraction(0) for _ in range(n)]
+        x[f] = Fraction(1)
+        for row_idx in range(len(pivots) - 1, -1, -1):
+            pcol = pivots[row_idx]
+            row = rref[row_idx]
+            x[pcol] = -sum(row[j] * x[j] for j in range(pcol + 1, n))
+        if all(v < 0 for v in x):
+            x = [-v for v in x]
+        return x if all(v > 0 for v in x) else None
+
+    # Multiple valid stoichiometric directions occur when several independent
+    # reactants can contribute the same conserved elements.  Search only small
+    # exact systems so CPU use remains bounded on the free server.
+    if len(free) > _MAX_FREE_DIM:
         return None
-    # A chemically useful solution must have all coefficients with one sign.
-    if all(v < 0 for v in x):
-        x = [-v for v in x]
-    if not all(v > 0 for v in x):
+
+    best: list[int] | None = None
+    best_score: tuple | None = None
+    for values in product(range(1, _MAX_FREE_VALUE + 1), repeat=len(free)):
+        x = [Fraction(0) for _ in range(n)]
+        for col, value in zip(free, values):
+            x[col] = Fraction(value)
+        for row_idx in range(len(pivots) - 1, -1, -1):
+            pcol = pivots[row_idx]
+            row = rref[row_idx]
+            x[pcol] = -sum(row[j] * x[j] for j in range(pcol + 1, n))
+        ints = _normalize_positive(x)
+        if ints is None:
+            continue
+        score = (sum(ints), max(ints), tuple(ints))
+        if best_score is None or score < best_score:
+            best, best_score = ints, score
+
+    if best is None:
         return None
-    return x
+    return [Fraction(v) for v in best]
 
 
 def balance_reaction_smiles(
     reactant_smiles: list[str], product_smiles: list[str]
 ) -> tuple[list[int], list[int]] | None:
-    """Return the smallest positive integer coefficients, or ``None``.
+    """Return the smallest positive integer coefficients found, or ``None``.
 
-    Species are fixed: the routine never invents H2O, H+, electrons, etc.  This
-    prevents chemically misleading automatic balancing when the entered species
-    set is incomplete.
+    Species are fixed: the routine never invents H2O, H+, OH-, electrons, or any
+    other missing species.  Formal charge is conserved alongside every element.
     """
     if not reactant_smiles or not product_smiles:
         return None
@@ -114,7 +156,6 @@ def balance_reaction_smiles(
             row.append(Fraction(count if i < nr else -count))
         rows.append(row)
 
-    # Formal charge conservation is an independent stoichiometric constraint.
     charge_row = [
         Fraction((item[1] if i < nr else -item[1]) if item else 0)
         for i, item in enumerate(vectors)
@@ -122,14 +163,11 @@ def balance_reaction_smiles(
     if any(charge_row):
         rows.append(charge_row)
 
-    vec = _one_dimensional_null_vector(rows)
+    vec = _smallest_positive_null_vector(rows)
     if vec is None:
         return None
 
-    denominator_lcm = reduce(_lcm, (v.denominator for v in vec), 1)
-    ints = [int(v * denominator_lcm) for v in vec]
-    common = reduce(gcd, (abs(v) for v in ints if v), 0) or 1
-    ints = [v // common for v in ints]
-    if not all(v > 0 for v in ints):
+    ints = _normalize_positive(vec)
+    if ints is None:
         return None
     return ints[:nr], ints[nr:]
