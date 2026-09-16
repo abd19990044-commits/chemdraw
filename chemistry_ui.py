@@ -16,7 +16,8 @@ class ChemUserSettings:
     export_png: bool = True
     export_svg: bool = True
     export_tiff: bool = False
-    export_rxn: bool = True
+    export_cdxml: bool = True
+    export_rxn: bool = False
     transparent_background: bool = False
     show_balance_report: bool = True
 
@@ -74,7 +75,10 @@ def settings_keyboard(settings: ChemUserSettings) -> InlineKeyboardMarkup:
             InlineKeyboardButton(f"{_mark(settings.export_png)} PNG", callback_data="chem:png"),
             InlineKeyboardButton(f"{_mark(settings.export_svg)} SVG", callback_data="chem:svg"),
             InlineKeyboardButton(f"{_mark(settings.export_tiff)} TIFF", callback_data="chem:tiff"),
-            InlineKeyboardButton(f"{_mark(settings.export_rxn)} RXN", callback_data="chem:rxn"),
+        ],
+        [
+            InlineKeyboardButton(f"{_mark(settings.export_cdxml)} CDXML · ChemDraw", callback_data="chem:cdxml"),
+            InlineKeyboardButton(f"{_mark(settings.export_rxn)} RXN · compatibility", callback_data="chem:rxn"),
         ],
         [InlineKeyboardButton(f"{_mark(settings.transparent_background)} Transparent background", callback_data="chem:transparent")],
         [InlineKeyboardButton("🧪 Advanced chemistry", callback_data="chem:advanced")],
@@ -108,8 +112,9 @@ def settings_text(s: ChemUserSettings) -> str:
         f"Balance report: {'ON' if s.show_balance_report else 'OFF'}\n"
         f"Transparent background: {'ON' if s.transparent_background else 'OFF'}\n\n"
         "<b>Exports</b>\n"
-        f"PNG: {'ON' if s.export_png else 'OFF'} · SVG: {'ON' if s.export_svg else 'OFF'} · "
-        f"TIFF: {'ON' if s.export_tiff else 'OFF'} · RXN: {'ON' if s.export_rxn else 'OFF'}"
+        f"PNG: {'ON' if s.export_png else 'OFF'} · SVG: {'ON' if s.export_svg else 'OFF'} · TIFF: {'ON' if s.export_tiff else 'OFF'}\n"
+        f"CDXML (editable in ChemDraw): {'ON' if s.export_cdxml else 'OFF'} · "
+        f"RXN compatibility: {'ON' if s.export_rxn else 'OFF'}"
     )
 
 
@@ -144,6 +149,7 @@ def help_text() -> str:
         "Conditions above the arrow:\n<code>Ethene + H2 = Ethane || Ni</code>\n\n"
         "Above and below the arrow:\n<code>Ethene + H2 = Ethane || Ni | 150 °C</code>\n\n"
         "The bot can automatically calculate the smallest whole-number stoichiometric coefficients. "
+        "CDXML is the primary editable ChemDraw export; RXN is kept only for compatibility. "
         "Advanced chemistry tools are available from the 🧪 button."
     )
 
@@ -166,6 +172,8 @@ def apply_action(user_id: int, action: str) -> ChemUserSettings:
         s.export_svg = not s.export_svg
     elif action == "tiff":
         s.export_tiff = not s.export_tiff
+    elif action == "cdxml":
+        s.export_cdxml = not s.export_cdxml
     elif action == "rxn":
         s.export_rxn = not s.export_rxn
     elif action == "transparent":
