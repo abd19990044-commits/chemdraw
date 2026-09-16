@@ -21,7 +21,7 @@ import html
 import importlib
 import re
 
-import publication_renderer as pub
+import publication_renderer_v2 as pub
 
 
 PUBLICATION_WELCOME_TEXT = (
