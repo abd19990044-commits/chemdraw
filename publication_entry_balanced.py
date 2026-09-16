@@ -25,6 +25,7 @@ from telegram.ext import (
 import chemistry_ui as ui
 import publication_entry as base
 import publication_renderer_v3 as pub
+from cdxml_export import generate_reaction_cdxml
 from reaction_balancer import balance_reaction_smiles
 
 
@@ -36,7 +37,6 @@ def _tiff_from_png(png_bytes: bytes, dpi: int = 600) -> bytes:
 
 
 def install_publication_renderer(app_module) -> None:
-    # Install parser/name-resolution/publication groundwork first.
     base.install_publication_renderer(app_module)
 
     app_module.WELCOME_TEXT = (
@@ -50,7 +50,9 @@ def install_publication_renderer(app_module) -> None:
         "• Forward, equilibrium and reversible reaction arrows\n"
         "• Smart condensed/skeletal molecular depiction\n"
         "• Reaction conditions above and below the arrow\n"
-        "• SVG vector, 600 DPI PNG, 600 DPI TIFF and editable RXN exports\n"
+        "• SVG vector, 600 DPI PNG and 600 DPI TIFF exports\n"
+        "• <b>CDXML file prepared to be opened and edited directly in ChemDraw</b>\n"
+        "• RXN retained only as an optional compatibility format\n"
         "• Optional transparent publication background\n"
         "• Element/charge balance verification\n\n"
         "Use the buttons below to configure your drawing preferences."
@@ -74,7 +76,6 @@ def install_publication_renderer(app_module) -> None:
         user_id = update.effective_user.id if update.effective_user else 0
         data = query.data or ""
         action = data.split(":", 1)[1] if ":" in data else "settings"
-
         if action == "help":
             await query.edit_message_text(
                 ui.help_text(),
@@ -82,36 +83,22 @@ def install_publication_renderer(app_module) -> None:
                 reply_markup=ui.settings_keyboard(ui.get_settings(user_id)),
             )
             return
-
-        if action in {"settings", "exports"}:
-            settings = ui.get_settings(user_id)
-        else:
-            settings = ui.apply_action(user_id, action)
-
+        settings = ui.get_settings(user_id) if action in {"settings", "exports"} else ui.apply_action(user_id, action)
         await query.edit_message_text(
             ui.settings_text(settings),
             parse_mode="HTML",
             reply_markup=ui.settings_keyboard(settings),
         )
 
-    async def publication_handle_reaction_balanced(
-        update,
-        status_msg,
-        text: str,
-        separator: str,
-        index: int,
-    ) -> None:
+    async def publication_handle_reaction_balanced(update, status_msg, text: str, separator: str, index: int) -> None:
         user_id = update.effective_user.id if update.effective_user else None
         settings = ui.get_settings(user_id)
 
         reaction_text, arrow_top, arrow_bottom = base._extract_conditions(text)
         sep_info = app_module.find_reaction_separator(reaction_text)
         if not sep_info:
-            await status_msg.edit_text(
-                "⚠️ I could not identify the reaction separator after reading the reaction conditions."
-            )
+            await status_msg.edit_text("⚠️ I could not identify the reaction separator after reading the reaction conditions.")
             return
-
         separator, index = sep_info
         if separator == ">>":
             left, right = reaction_text[:index], reaction_text[index + 2:]
@@ -126,7 +113,6 @@ def install_publication_renderer(app_module) -> None:
 
         reactant_resolved, reactant_notes = await app_module._resolve_terms(reactant_terms)
         product_resolved, product_notes = await app_module._resolve_terms(product_terms)
-
         unresolved = [term.name for term, (_, smiles) in zip(reactant_terms, reactant_resolved) if smiles is None]
         unresolved += [term.name for term, (_, smiles) in zip(product_terms, product_resolved) if smiles is None]
         if unresolved:
@@ -191,6 +177,15 @@ def install_publication_renderer(app_module) -> None:
             arrow_style=settings.arrow_style,
             transparent_background=settings.transparent_background,
         )
+        cdxml_task = asyncio.to_thread(
+            generate_reaction_cdxml,
+            reactant_pairs,
+            product_pairs,
+            arrow_top=arrow_top,
+            arrow_bottom=arrow_bottom,
+            arrow_style=settings.arrow_style,
+            title=equation,
+        )
         rxn_task = asyncio.to_thread(
             app_module.generate_rxn_file,
             [app_module.ReactionTerm(c, s) for c, s in reactant_pairs],
@@ -198,7 +193,7 @@ def install_publication_renderer(app_module) -> None:
             "Reaction.rxn",
             equation,
         )
-        png_bytes, svg_bytes, rxn_file = await asyncio.gather(png_task, svg_task, rxn_task)
+        png_bytes, svg_bytes, cdxml_bytes, rxn_file = await asyncio.gather(png_task, svg_task, cdxml_task, rxn_task)
 
         caption_lines = ["<b>Reaction scheme</b>", f"<code>{html.escape(equation)}</code>"]
         if automatically_balanced:
@@ -215,7 +210,6 @@ def install_publication_renderer(app_module) -> None:
             caption_lines.append("ℹ️ " + html.escape(note))
         caption = "\n".join(caption_lines)
 
-        # Always send a visual preview; export toggles control document files.
         if png_bytes:
             preview = app_module.bytes_to_named_bytesio(png_bytes, "Reaction_preview.png")
             await update.message.reply_photo(
@@ -224,44 +218,41 @@ def install_publication_renderer(app_module) -> None:
                 parse_mode="HTML",
                 reply_markup=ui.welcome_keyboard(user_id),
             )
-
         if settings.export_png and png_bytes:
             await update.message.reply_document(
                 document=app_module.bytes_to_named_bytesio(png_bytes, "Reaction_600dpi.png"),
                 caption="Publication PNG — 600 DPI",
             )
-
         if settings.export_svg and svg_bytes:
             await update.message.reply_document(
                 document=app_module.bytes_to_named_bytesio(svg_bytes, "Reaction_vector.svg"),
-                caption="Publication vector SVG — recommended for manuscripts and editing",
+                caption="Publication vector SVG — recommended for manuscripts and graphical editing",
             )
-
         if settings.export_tiff and png_bytes:
             tiff_bytes = await asyncio.to_thread(_tiff_from_png, png_bytes, 600)
             await update.message.reply_document(
                 document=app_module.bytes_to_named_bytesio(tiff_bytes, "Reaction_600dpi.tiff"),
                 caption="Publication TIFF — 600 DPI (LZW)",
             )
-
+        if settings.export_cdxml and cdxml_bytes:
+            await update.message.reply_document(
+                document=app_module.bytes_to_named_bytesio(cdxml_bytes, "Reaction_editable.cdxml"),
+                caption="Editable ChemDraw CDXML — prepared to be opened and edited directly in ChemDraw",
+            )
         if settings.export_rxn and rxn_file:
             await update.message.reply_document(
                 document=rxn_file,
-                caption="Editable MDL reaction file (.rxn)",
+                caption="MDL RXN compatibility file — optional interchange format",
             )
-
         await status_msg.delete()
 
     async def interactive_run_message(update, context) -> None:
-        # Preserve the established text-processing flow while using the patched
-        # reaction handler above and current per-user settings.
         await app_module.handle_chemical_message(update, context)
 
     def run_chem_bot_interactive() -> None:
         if not app_module.CHEM_BOT_TOKEN:
             app_module.chem_logger.error("CRITICAL: CHEM_BOT_TOKEN is not set. Chemistry bot will NOT start.")
             return
-
         application = (
             Application.builder()
             .token(app_module.CHEM_BOT_TOKEN)
@@ -281,11 +272,10 @@ def install_publication_renderer(app_module) -> None:
             close_loop=False,
         )
 
-    # Chemistry Drawing Bot call points only.
     app_module.chem_start_command = interactive_start
     app_module._handle_reaction = publication_handle_reaction_balanced
     app_module.run_chem_bot = run_chem_bot_interactive
     app_module.render_reaction_scheme = pub.render_reaction_scheme
     app_module.chem_logger.info(
-        "Professional chemistry UI enabled: per-user settings, arrow styles, auto-balance, PNG/SVG/TIFF/RXN exports."
+        "Professional chemistry UI enabled: CDXML primary editable export, optional RXN compatibility, PNG/SVG/TIFF."
     )
