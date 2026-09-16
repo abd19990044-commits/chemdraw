@@ -1,14 +1,6 @@
 from __future__ import annotations
 
-"""ChemDraw-oriented CDXML reaction export.
-
-The exporter writes editable atom/bond fragments, stoichiometric coefficient
-labels, reaction arrow and condition labels into one CDXML page.  It is meant
-as the primary ChemDraw editing format; MDL RXN remains a compatibility export.
-"""
-
 from fractions import Fraction
-from html import escape
 from xml.etree import ElementTree as ET
 
 from rdkit import Chem
@@ -78,11 +70,11 @@ def _add_text(page: ET.Element, obj_id: int, x: float, y: float, text: str, size
 def _add_fragment(page: ET.Element, obj_id: int, mol: Chem.Mol, x0: float, center_y: float) -> tuple[int, float]:
     minx, maxx, miny, maxy = _mol_extent(mol)
     width = max((maxx - minx) * BOND_LENGTH, BOND_LENGTH)
-    height = max((maxy - miny) * BOND_LENGTH, BOND_LENGTH)
     frag = ET.SubElement(page, "fragment", {"id": str(obj_id)})
     obj_id += 1
     conf = mol.GetConformer()
     atom_ids: dict[int, int] = {}
+
     for i, atom in enumerate(mol.GetAtoms()):
         p = conf.GetAtomPosition(i)
         x = x0 + (p.x - minx) * BOND_LENGTH
@@ -132,25 +124,25 @@ def generate_reaction_cdxml(
     arrow_style: str = "forward",
     title: str = "Reaction",
 ) -> bytes | None:
-    """Create an editable ChemDraw CDXML reaction document."""
     reactants = []
     products = []
+
     for coef, smiles in reactant_pairs:
         mol = _prepare_mol(smiles)
         if mol is None:
             return None
         reactants.append((Fraction(coef), mol))
+
     for coef, smiles in product_pairs:
         mol = _prepare_mol(smiles)
         if mol is None:
             return None
         products.append((Fraction(coef), mol))
+
     if not reactants or not products:
         return None
 
     root = ET.Element("CDXML", {
-        "CreationProgram": "Chemistry Drawing Bot",
-        "Name": title[:80],
         "BoundingBox": "0 0 1200 420",
         "BondLength": str(BOND_LENGTH),
         "LabelFont": "3",
@@ -158,12 +150,20 @@ def generate_reaction_cdxml(
         "CaptionFont": "3",
         "CaptionSize": "180",
     })
+
     color_table = ET.SubElement(root, "colortable")
     ET.SubElement(color_table, "color", {"r": "1", "g": "1", "b": "1"})
     ET.SubElement(color_table, "color", {"r": "0", "g": "0", "b": "0"})
+
     font_table = ET.SubElement(root, "fonttable")
     ET.SubElement(font_table, "font", {"id": "3", "charset": "iso-8859-1", "name": "Arial"})
-    page = ET.SubElement(root, "page", {"id": "1", "BoundingBox": "0 0 1200 420", "Width": "1200", "Height": "420"})
+
+    page = ET.SubElement(root, "page", {
+        "id": "1",
+        "BoundingBox": "0 0 1200 420",
+        "Width": "1200",
+        "Height": "420",
+    })
 
     obj_id = 2
     x = PAGE_MARGIN
@@ -197,12 +197,14 @@ def generate_reaction_cdxml(
         "ArrowType": "FullHead",
         "HeadSize": "1000",
     }
+
     if arrow_style == "equilibrium":
         graphic_attrs["ArrowType"] = "Equilibrium"
     elif arrow_style == "reversible":
         graphic_attrs["ArrowType"] = "FullHead"
         graphic_attrs["ArrowheadHead"] = "Full"
         graphic_attrs["ArrowheadTail"] = "Full"
+
     ET.SubElement(page, "graphic", graphic_attrs)
     obj_id += 1
 
@@ -214,9 +216,9 @@ def generate_reaction_cdxml(
     x = arrow_x2 + MOL_GAP
     _, x = add_side(products, x)
 
-    page.set("BoundingBox", f"0 0 {max(600, x + PAGE_MARGIN):.0f} 360")
-    page.set("Width", f"{max(600, x + PAGE_MARGIN):.0f}")
+    page_width = max(600, x + PAGE_MARGIN)
+    page.set("BoundingBox", f"0 0 {page_width:.0f} 360")
+    page.set("Width", f"{page_width:.0f}")
     root.set("BoundingBox", page.get("BoundingBox", "0 0 1200 420"))
 
-    xml = ET.tostring(root, encoding="utf-8", xml_declaration=True)
-    return xml
+    return ET.tostring(root, encoding="utf-8", xml_declaration=True)
