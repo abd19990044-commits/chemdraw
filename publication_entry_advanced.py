@@ -37,9 +37,6 @@ def _format_redox_with_names(result: adv.RedoxResult, reactant_terms, product_te
 def install_publication_renderer(app_module) -> None:
     base.install_publication_renderer(app_module)
 
-    # Replace only the chemistry RXN exporter.  The established handlers keep
-    # their original call signature, while the new exporter preserves canonical
-    # per-molecule 2D orientation instead of re-laying out the whole reaction.
     def generate_chemdraw_consistent_rxn(reactant_terms, product_terms, filename: str, title: str = ""):
         reactant_pairs = [(term.coefficient, term.name) for term in reactant_terms]
         product_pairs = [(term.coefficient, term.name) for term in product_terms]
@@ -51,40 +48,18 @@ def install_publication_renderer(app_module) -> None:
         )
 
     app_module.generate_rxn_file = generate_chemdraw_consistent_rxn
-    app_module.WELCOME_TEXT += (
-        "\n\n<b>RXN / ChemDraw note</b>\n"
-        "RXN now preserves the same canonical molecular orientation used by the publication renderer. "
-        "Classic MDL RXN does not store the complete page layout (arrow geometry, condition labels, or coefficient typography), "
-        "so use the SVG export when exact visual fidelity to the Telegram preview is required."
-    )
 
-    old_handle_reaction = app_module._handle_reaction
+    def cache_final_reaction(user_id, reactant_terms, product_terms, reactant_pairs, product_pairs, equation) -> None:
+        uid = int(user_id or 0)
+        _LAST_REACTION[uid] = {
+            "reactant_terms": list(reactant_terms),
+            "product_terms": list(product_terms),
+            "reactant_pairs": list(reactant_pairs),
+            "product_pairs": list(product_pairs),
+            "equation": equation,
+        }
 
-    async def capture_reaction(update, status_msg, text: str, separator: str, index: int) -> None:
-        user_id = update.effective_user.id if update.effective_user else 0
-        try:
-            reaction_text, _, _ = __import__("publication_entry")._extract_conditions(text)
-            sep_info = app_module.find_reaction_separator(reaction_text)
-            if sep_info:
-                sep, idx = sep_info
-                if sep == ">>":
-                    left, right = reaction_text[:idx], reaction_text[idx + 2:]
-                else:
-                    left, right = reaction_text[:idx], reaction_text[idx + 1:]
-                reactant_terms = app_module.split_compound_terms(left)
-                product_terms = app_module.split_compound_terms(right)
-                rr, _ = await app_module._resolve_terms(reactant_terms)
-                pr, _ = await app_module._resolve_terms(product_terms)
-                if all(smi for _, smi in rr + pr):
-                    _LAST_REACTION[int(user_id)] = {
-                        "reactant_terms": reactant_terms,
-                        "product_terms": product_terms,
-                        "reactant_pairs": [(coef, smi) for coef, smi in rr],
-                        "product_pairs": [(coef, smi) for coef, smi in pr],
-                    }
-        except Exception as exc:
-            app_module.chem_logger.warning("Could not cache last reaction for advanced chemistry: %s", exc)
-        await old_handle_reaction(update, status_msg, text, separator, index)
+    app_module._publication_final_reaction_hook = cache_final_reaction
 
     async def advanced_start(update, context) -> None:
         user_id = update.effective_user.id if update.effective_user else 0
@@ -235,9 +210,8 @@ def install_publication_renderer(app_module) -> None:
             close_loop=False,
         )
 
-    app_module._handle_reaction = capture_reaction
     app_module.chem_start_command = advanced_start
     app_module.run_chem_bot = run_chem_bot_advanced
     app_module.chem_logger.info(
-        "Advanced chemistry engine installed; ChemDraw-consistent canonical RXN exporter enabled without modifying ORCA/Flask."
+        "Advanced chemistry engine installed; final balanced reaction state is reused by advanced tools without modifying ORCA/Flask."
     )
