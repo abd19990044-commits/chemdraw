@@ -11,14 +11,15 @@ Optional reaction conditions::
 
     Reactants = Products || condition above arrow | condition below arrow
 
-Example::
+General example::
 
-    Naproxen + NBS = 5-bromonaproxen + succinimide || NBS, CH3COOH | 15 min, dark
+    Ethene + H2 = Ethane || Ni | 150 C
 """
 
 import asyncio
 import html
 import importlib
+import re
 
 import publication_renderer as pub
 
@@ -45,11 +46,11 @@ PUBLICATION_WELCOME_TEXT = (
     "<b>Conditions above the arrow</b>\n"
     "Add <code>||</code> after the reaction, then type the condition.\n"
     "Example:\n"
-    "<code>2 H2 + O2 = 2 H2O || Pt</code>\n\n"
+    "<code>Ethene + H2 = Ethane || Ni</code>\n\n"
     "<b>Conditions above and below the arrow</b>\n"
     "Use <code>|| above | below</code>.\n"
     "Example:\n"
-    "<code>Naproxen + NBS = 5-bromonaproxen + succinimide || NBS, CH3COOH | 15 min, dark</code>\n\n"
+    "<code>Ethene + H2 = Ethane || Ni | 150 °C</code>\n\n"
     "<b>Research-quality output</b>\n"
     "• SVG vector file for direct manuscript insertion and editing\n"
     "• 600 DPI PNG at original resolution\n"
@@ -72,20 +73,12 @@ def _extract_conditions(text: str) -> tuple[str, str, str]:
 
 
 def _publication_reaction_separator(text: str, original_finder):
-    """Identify obvious reactions before RDKit ever sees the whole equation.
-
-    The legacy finder starts by calling ``MolFromSmiles`` on the complete input.
-    That is reasonable for distinguishing a SMILES double bond from a reaction
-    separator, but strings such as ``2 H2 + O2 = 2 H2O`` then generate noisy
-    RDKit SMILES parse errors in production logs.  This fast path handles real
-    equations and condition suffixes without changing single-molecule behavior.
-    """
+    """Identify obvious reactions before RDKit ever sees the whole equation."""
     reaction_text, _, _ = _extract_conditions(text or "")
     s = reaction_text.strip()
     if not s:
         return None
 
-    # Top-level >> is unambiguous as a reaction separator.
     bracket = 0
     paren = 0
     i = 0
@@ -105,9 +98,6 @@ def _publication_reaction_separator(text: str, original_finder):
                     return ">>", i
         i += 1
 
-    # Find top-level '=' only. This deliberately ignores C=O inside SMILES
-    # parentheses/brackets and accepts either whitespace-delimited equations or
-    # equations whose sides contain '+' species separators.
     candidates: list[int] = []
     bracket = 0
     paren = 0
@@ -145,8 +135,44 @@ def _publication_reaction_separator(text: str, original_finder):
                 return "=", idx
         return "=", candidates[-1]
 
-    # For a genuine single SMILES/name, retain the established behavior.
     return original_finder(s)
+
+
+def _looks_like_plain_chemical_name(token: str) -> bool:
+    """Conservatively identify tokens that should not be probed as SMILES.
+
+    This is intentionally narrow: obvious SMILES punctuation still goes through
+    the legacy detector, while ordinary words and locant-style names such as
+    ``2-methylbutane`` are treated as names without making RDKit emit parse
+    errors into production logs.
+    """
+    s = (token or "").strip()
+    if not s or " " in s:
+        return True
+
+    # Obvious structure syntax should remain eligible for SMILES detection.
+    if re.search(r"[\[\]()=#@/\\.%:]", s):
+        return False
+
+    # Locant/name style: digit(s)-word..., e.g. 2-methylbutane.
+    if re.fullmatch(r"\d+(?:,\d+)*-[A-Za-z][A-Za-z0-9-]*", s):
+        return True
+
+    # Hyphenated alphabetic words are overwhelmingly chemical names here.
+    if "-" in s and re.fullmatch(r"[A-Za-z][A-Za-z0-9-]*", s):
+        return True
+
+    # Plain words containing letters impossible in ordinary organic-subset
+    # SMILES are names. Keep compact valid-looking strings such as CCO/CN for
+    # the legacy SMILES detector.
+    if re.fullmatch(r"[A-Za-z]+", s):
+        smiles_letters = set("BCNOPSFIHclbrnospa")
+        if any(ch not in smiles_letters for ch in s):
+            return True
+        if len(s) > 5 and any(ch.islower() for ch in s):
+            return True
+
+    return False
 
 
 def install_publication_renderer(app_module) -> None:
@@ -156,9 +182,20 @@ def install_publication_renderer(app_module) -> None:
     """
 
     original_find_reaction_separator = app_module.find_reaction_separator
+    original_detect_input_kind = app_module.detect_input_kind
 
     def publication_find_reaction_separator(text: str):
         return _publication_reaction_separator(text, original_find_reaction_separator)
+
+    def publication_detect_input_kind(token: str):
+        stripped = (token or "").strip()
+        if app_module.is_valid_cas_number(stripped):
+            return app_module.InputKind.CAS
+        if stripped.upper().startswith("INCHI="):
+            return app_module.InputKind.INCHI
+        if _looks_like_plain_chemical_name(stripped):
+            return app_module.InputKind.NAME
+        return original_detect_input_kind(stripped)
 
     def publication_split_compound_terms(text: str):
         return [
@@ -292,6 +329,7 @@ def install_publication_renderer(app_module) -> None:
     # Patch Chemistry Drawing Bot symbols only.
     app_module.WELCOME_TEXT = PUBLICATION_WELCOME_TEXT
     app_module.find_reaction_separator = publication_find_reaction_separator
+    app_module.detect_input_kind = publication_detect_input_kind
     app_module.split_compound_terms = publication_split_compound_terms
     app_module.render_reaction_scheme = pub.render_reaction_scheme
     app_module._handle_reaction = publication_handle_reaction
