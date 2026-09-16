@@ -3,6 +3,10 @@ from xml.etree import ElementTree as ET
 from cdxml_export import generate_reaction_cdxml
 
 
+def _arrow(root):
+    return next(g for g in root.findall("page/graphic") if g.get("ArrowType"))
+
+
 def test_cdxml_contains_editable_fragments_arrow_and_conditions():
     data = generate_reaction_cdxml(
         [(2, "[H][H]"), (1, "O=O")],
@@ -11,6 +15,7 @@ def test_cdxml_contains_editable_fragments_arrow_and_conditions():
         arrow_bottom="25 °C",
         arrow_style="forward",
         title="2 H2 + O2 -> 2 H2O",
+        small_as_formula=False,
     )
     assert data is not None
     root = ET.fromstring(data)
@@ -21,13 +26,37 @@ def test_cdxml_contains_editable_fragments_arrow_and_conditions():
     assert len(fragments) == 3
     assert sum(len(f.findall("n")) for f in fragments) > 0
     assert sum(len(f.findall("b")) for f in fragments) > 0
-    graphics = page.findall("graphic")
-    assert len(graphics) == 1
-    assert graphics[0].get("ArrowType") == "FullHead"
+    assert _arrow(root).get("ArrowType") == "FullHead"
     texts = ["".join(t.itertext()) for t in page.findall("t")]
     assert "2" in texts
     assert "catalyst" in texts
     assert "25 °C" in texts
+
+
+def test_cdxml_forward_arrow_points_right_in_chemdraw_coordinate_order():
+    data = generate_reaction_cdxml([(1, "C=C")], [(1, "CC")])
+    root = ET.fromstring(data)
+    box = [float(v) for v in _arrow(root).get("BoundingBox").split()]
+    assert box[0] > box[2]
+
+
+def test_cdxml_smart_mode_matches_condensed_small_species():
+    data = generate_reaction_cdxml(
+        [(1, "C=C"), (1, "[H][H]")],
+        [(1, "CC")],
+        arrow_top="Ni",
+        arrow_bottom="150 °C",
+        small_as_formula=True,
+    )
+    assert data is not None
+    root = ET.fromstring(data)
+    text = " ".join("".join(t.itertext()) for t in root.findall("page/t"))
+    assert "CH₂" in text
+    assert "H₂" in text
+    assert "CH₃" in text
+    assert len(root.findall("page/fragment")) == 0
+    plain_lines = [g for g in root.findall("page/graphic") if not g.get("ArrowType")]
+    assert len(plain_lines) >= 3
 
 
 def test_cdxml_equilibrium_arrow():
@@ -38,9 +67,7 @@ def test_cdxml_equilibrium_arrow():
     )
     assert data is not None
     root = ET.fromstring(data)
-    graphic = root.find("page/graphic")
-    assert graphic is not None
-    assert graphic.get("ArrowType") == "Equilibrium"
+    assert _arrow(root).get("ArrowType") == "Equilibrium"
 
 
 def test_cdxml_is_source_neutral():
@@ -65,18 +92,12 @@ def test_cdxml_preserves_chiral_wedge_or_dash_depiction():
     data = generate_reaction_cdxml(
         [(1, "C[C@H](O)C(=O)O")],
         [(1, "C[C@H](O)C(=O)O")],
+        small_as_formula=False,
     )
     assert data is not None
     root = ET.fromstring(data)
-    displays = [
-        bond.get("Display")
-        for bond in root.findall("page/fragment/b")
-        if bond.get("Display")
-    ]
-    assert any(
-        display in {"WedgeBegin", "WedgedHashBegin", "WedgeEnd", "WedgedHashEnd"}
-        for display in displays
-    )
+    displays = [bond.get("Display") for bond in root.findall("page/fragment/b") if bond.get("Display")]
+    assert any(display in {"WedgeBegin", "WedgedHashBegin", "WedgeEnd", "WedgedHashEnd"} for display in displays)
 
 
 def test_cdxml_uses_normal_chemdraw_font_scale():
