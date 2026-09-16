@@ -8,9 +8,9 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Hashable
 
 
-# Render Free exposes very little CPU. A single CPU-bound chemistry worker gives
-# better aggregate throughput and much lower peak memory than allowing RDKit and
-# Pillow to fan out across the default asyncio executor.
+# Render Free has very limited CPU/RAM. Keep chemistry CPU work deliberately
+# serialized by default. Extra requests wait in a bounded request queue instead
+# of starting more RDKit/Pillow jobs in parallel.
 _WORKERS = max(1, int(os.getenv("CHEM_RENDER_WORKERS", "1")))
 _MAX_PENDING = max(_WORKERS, int(os.getenv("CHEM_MAX_PENDING", "48")))
 _CACHE_MAX_BYTES = max(0, int(os.getenv("CHEM_RENDER_CACHE_MB", "12"))) * 1024 * 1024
@@ -31,16 +31,26 @@ def capacity_snapshot() -> dict[str, int]:
     with _cache_lock:
         items = len(_cache)
         cache_bytes = _cache_bytes
+    queued = max(0, pending - _WORKERS)
     return {
         "workers": _WORKERS,
         "pending": pending,
+        "queued": queued,
         "max_pending": _MAX_PENDING,
+        "max_queue": max(0, _MAX_PENDING - _WORKERS),
         "cache_items": items,
         "cache_bytes": cache_bytes,
     }
 
 
 def try_reserve() -> bool:
+    """Reserve one bounded chemistry request slot.
+
+    A successful reservation may execute immediately or wait behind already
+    reserved requests. The ThreadPoolExecutor is the actual FIFO-ish worker
+    queue; _MAX_PENDING caps how many live Telegram requests are allowed to wait
+    so memory cannot grow without bound.
+    """
     global _pending
     with _pending_lock:
         if _pending >= _MAX_PENDING:
@@ -54,6 +64,12 @@ def release() -> None:
     with _pending_lock:
         if _pending > 0:
             _pending -= 1
+
+
+def queued_position() -> int:
+    """Return an approximate 1-based waiting position for a newly reserved job."""
+    with _pending_lock:
+        return max(0, _pending - _WORKERS)
 
 
 def cache_get(key: Hashable) -> bytes | None:
