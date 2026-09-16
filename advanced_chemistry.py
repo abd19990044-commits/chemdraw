@@ -142,11 +142,6 @@ def _balance_vectors(left: list[tuple[dict[str, int], int]], right: list[tuple[d
 
 
 def balance_redox(reactant_smiles: list[str], product_smiles: list[str], medium: str = "acidic") -> RedoxResult | None:
-    """Balance a redox equation by adding only medium-appropriate helper species.
-
-    Acidic medium allows H2O, H+, e-. Basic medium allows H2O, OH-, e-.
-    Each helper may appear on one side or be absent. Ambiguous solutions are rejected.
-    """
     medium = medium.lower().strip()
     if medium not in {"acidic", "basic"} or not reactant_smiles or not product_smiles:
         return None
@@ -155,9 +150,7 @@ def balance_redox(reactant_smiles: list[str], product_smiles: list[str], medium:
     if any(v is None for v in base_left + base_right):
         return None
     helper_names = ["H2O", "H+", "e-"] if medium == "acidic" else ["H2O", "OH-", "e-"]
-
     candidates: list[tuple[tuple[int, int, int], RedoxResult]] = []
-    # states: -1 left, 0 absent, +1 right
     for states in product((-1, 0, 1), repeat=len(helper_names)):
         left_vec = list(base_left)
         right_vec = list(base_right)
@@ -168,16 +161,13 @@ def balance_redox(reactant_smiles: list[str], product_smiles: list[str], medium:
                 continue
             counts, charge, smi = _HELPERS[name]
             if state < 0:
-                left_vec.append((counts, charge))
-                left_labels.append((name, smi))
+                left_vec.append((counts, charge)); left_labels.append((name, smi))
             else:
-                right_vec.append((counts, charge))
-                right_labels.append((name, smi))
+                right_vec.append((counts, charge)); right_labels.append((name, smi))
         solved = _balance_vectors(left_vec, right_vec)
         if solved is None:
             continue
         lc, rc = solved
-        # all original species must be present positively by construction; reject electron on both impossible via states.
         left_species = tuple(BalancedSpecies(c, label, smi) for c, (label, smi) in zip(lc, left_labels))
         right_species = tuple(BalancedSpecies(c, label, smi) for c, (label, smi) in zip(rc, right_labels))
         helper_count = sum(1 for s in states if s)
@@ -189,44 +179,25 @@ def balance_redox(reactant_smiles: list[str], product_smiles: list[str], medium:
     candidates.sort(key=lambda x: x[0])
     best_score = candidates[0][0]
     best = [r for score, r in candidates if score == best_score]
-    if len(best) != 1:
-        return None
-    return best[0]
+    return best[0] if len(best) == 1 else None
 
 
 def format_redox(result: RedoxResult) -> str:
     def side(items: Iterable[BalancedSpecies]) -> str:
-        parts = []
-        for sp in items:
-            prefix = "" if sp.coefficient == 1 else f"{sp.coefficient} "
-            parts.append(prefix + sp.label)
-        return " + ".join(parts)
+        return " + ".join(("" if sp.coefficient == 1 else f"{sp.coefficient} ") + sp.label for sp in items)
     return f"{side(result.reactants)} → {side(result.products)}"
 
 
-# Explicit conservative dissociation rules. Anything not listed stays molecular.
 _STRONG_ELECTROLYTES: dict[str, tuple[tuple[int, str], ...]] = {
-    "HCl": ((1, "H+"), (1, "Cl-")),
-    "HBr": ((1, "H+"), (1, "Br-")),
-    "HI": ((1, "H+"), (1, "I-")),
-    "HNO3": ((1, "H+"), (1, "NO3-")),
-    "HClO4": ((1, "H+"), (1, "ClO4-")),
-    "H2SO4": ((2, "H+"), (1, "SO4^2-")),
-    "NaOH": ((1, "Na+"), (1, "OH-")),
-    "KOH": ((1, "K+"), (1, "OH-")),
-    "LiOH": ((1, "Li+"), (1, "OH-")),
-    "NaCl": ((1, "Na+"), (1, "Cl-")),
-    "KCl": ((1, "K+"), (1, "Cl-")),
-    "NaNO3": ((1, "Na+"), (1, "NO3-")),
-    "KNO3": ((1, "K+"), (1, "NO3-")),
-    "Na2SO4": ((2, "Na+"), (1, "SO4^2-")),
+    "HCl": ((1, "H+"), (1, "Cl-")), "HBr": ((1, "H+"), (1, "Br-")),
+    "HI": ((1, "H+"), (1, "I-")), "HNO3": ((1, "H+"), (1, "NO3-")),
+    "HClO4": ((1, "H+"), (1, "ClO4-")), "H2SO4": ((2, "H+"), (1, "SO4^2-")),
+    "NaOH": ((1, "Na+"), (1, "OH-")), "KOH": ((1, "K+"), (1, "OH-")),
+    "LiOH": ((1, "Li+"), (1, "OH-")), "NaCl": ((1, "Na+"), (1, "Cl-")),
+    "KCl": ((1, "K+"), (1, "Cl-")), "NaNO3": ((1, "Na+"), (1, "NO3-")),
+    "KNO3": ((1, "K+"), (1, "NO3-")), "Na2SO4": ((2, "Na+"), (1, "SO4^2-")),
     "K2SO4": ((2, "K+"), (1, "SO4^2-")),
 }
-
-
-def _formula(smiles: str) -> str:
-    mol = Chem.MolFromSmiles(smiles)
-    return rdMolDescriptors.CalcMolFormula(mol) if mol is not None else smiles
 
 
 def _ion_label_from_fragment(mol: Chem.Mol) -> str:
@@ -245,10 +216,9 @@ def _expand_electrolyte(smiles: str) -> tuple[tuple[int, str], ...]:
         return ((1, smiles),)
     frags = Chem.GetMolFrags(mol, asMols=True, sanitizeFrags=True)
     if len(frags) > 1 and all(sum(a.GetFormalCharge() for a in f.GetAtoms()) != 0 for f in frags):
-        labels = [_ion_label_from_fragment(f) for f in frags]
         counts: dict[str, int] = {}
-        for label in labels:
-            counts[label] = counts.get(label, 0) + 1
+        for f in frags:
+            label = _ion_label_from_fragment(f); counts[label] = counts.get(label, 0) + 1
         return tuple(sorted(((n, label) for label, n in counts.items()), key=lambda x: x[1]))
     formula = rdMolDescriptors.CalcMolFormula(mol)
     return _STRONG_ELECTROLYTES.get(formula, ((1, formula),))
@@ -258,72 +228,53 @@ def net_ionic_equation(reactant_pairs: list[tuple[int | Fraction, str]], product
     def expand(pairs):
         out: dict[str, Fraction] = {}
         for coeff, smiles in pairs:
-            c = Fraction(coeff)
             for mult, label in _expand_electrolyte(smiles):
-                out[label] = out.get(label, Fraction(0)) + c * mult
+                out[label] = out.get(label, Fraction(0)) + Fraction(coeff) * mult
         return out
-    left = expand(reactant_pairs)
-    right = expand(product_pairs)
+    left, right = expand(reactant_pairs), expand(product_pairs)
     cancelled: list[str] = []
     for label in sorted(set(left) & set(right)):
         n = min(left[label], right[label])
         if n > 0:
-            left[label] -= n
-            right[label] -= n
-            cancelled.append(label)
+            left[label] -= n; right[label] -= n; cancelled.append(label)
     if not any(v > 0 for v in left.values()) or not any(v > 0 for v in right.values()):
         return None
     den = reduce(_lcm, [v.denominator for v in list(left.values()) + list(right.values()) if v] or [1], 1)
     li = [(int(v * den), k) for k, v in left.items() if v > 0]
     ri = [(int(v * den), k) for k, v in right.items() if v > 0]
     common = reduce(gcd, [n for n, _ in li + ri], 0) or 1
-    li = [(n // common, k) for n, k in li]
-    ri = [(n // common, k) for n, k in ri]
-    return NetIonicResult(tuple(li), tuple(ri), tuple(cancelled))
+    return NetIonicResult(tuple((n // common, k) for n, k in li), tuple((n // common, k) for n, k in ri), tuple(cancelled))
 
 
 def format_net_ionic(result: NetIonicResult) -> str:
-    def side(items):
-        return " + ".join(("" if n == 1 else f"{n} ") + label for n, label in items)
+    def side(items): return " + ".join(("" if n == 1 else f"{n} ") + label for n, label in items)
     return f"{side(result.reactants)} → {side(result.products)}"
 
 
 def conservative_atom_map(reactant_smiles: list[str], product_smiles: list[str]) -> str | None:
-    """Return mapped reaction SMILES only for an unambiguous 1→1 unique-MCS case."""
     if len(reactant_smiles) != 1 or len(product_smiles) != 1:
         return None
-    r = Chem.MolFromSmiles(reactant_smiles[0])
-    p = Chem.MolFromSmiles(product_smiles[0])
+    r, p = Chem.MolFromSmiles(reactant_smiles[0]), Chem.MolFromSmiles(product_smiles[0])
     if r is None or p is None:
         return None
-    mcs = rdFMCS.FindMCS(
-        [r, p],
-        atomCompare=rdFMCS.AtomCompare.CompareElements,
-        bondCompare=rdFMCS.BondCompare.CompareOrder,
-        ringMatchesRingOnly=True,
-        completeRingsOnly=False,
-        timeout=5,
-    )
+    mcs = rdFMCS.FindMCS([r, p], atomCompare=rdFMCS.AtomCompare.CompareElements,
+                         bondCompare=rdFMCS.BondCompare.CompareOrder, ringMatchesRingOnly=True,
+                         completeRingsOnly=False, timeout=5)
     if mcs.canceled or mcs.numAtoms < 2:
         return None
     q = Chem.MolFromSmarts(mcs.smartsString)
     if q is None:
         return None
-    rm = r.GetSubstructMatches(q, uniquify=True)
-    pm = p.GetSubstructMatches(q, uniquify=True)
+    rm, pm = r.GetSubstructMatches(q, uniquify=True), p.GetSubstructMatches(q, uniquify=True)
     if len(rm) != 1 or len(pm) != 1:
         return None
     r2, p2 = Chem.Mol(r), Chem.Mol(p)
     next_map = 1
     for ra, pa in zip(rm[0], pm[0]):
-        r2.GetAtomWithIdx(ra).SetAtomMapNum(next_map)
-        p2.GetAtomWithIdx(pa).SetAtomMapNum(next_map)
-        next_map += 1
+        r2.GetAtomWithIdx(ra).SetAtomMapNum(next_map); p2.GetAtomWithIdx(pa).SetAtomMapNum(next_map); next_map += 1
     for mol in (r2, p2):
         for atom in mol.GetAtoms():
-            if not atom.GetAtomMapNum():
-                atom.SetAtomMapNum(next_map)
-                next_map += 1
+            if not atom.GetAtomMapNum(): atom.SetAtomMapNum(next_map); next_map += 1
     return f"{Chem.MolToSmiles(r2, isomericSmiles=True)}>>{Chem.MolToSmiles(p2, isomericSmiles=True)}"
 
 
@@ -331,46 +282,36 @@ _MECH_ARROW_RE = re.compile(r"^(\d+)\s*(->|~>)\s*(\d+)$")
 
 
 def parse_mechanism_arrows(spec: str) -> list[tuple[int, int, int]] | None:
-    """Parse '1->2,3~>4'; -> is electron pair, ~> is single electron."""
     arrows: list[tuple[int, int, int]] = []
     for token in [t.strip() for t in (spec or "").split(",") if t.strip()]:
         m = _MECH_ARROW_RE.fullmatch(token)
-        if not m:
-            return None
+        if not m: return None
         arrows.append((int(m.group(1)), int(m.group(3)), 2 if m.group(2) == "->" else 1))
     return arrows or None
 
 
-def render_mechanism_svg(smiles: str, arrows: list[tuple[int, int, int]]) -> bytes | None:
+def render_mechanism_svg(smiles: str, arrows: list[tuple[int, int, int]] | None = None) -> bytes | None:
+    """Render an atom-numbered molecule and optional user-directed curved arrows."""
     mol = Chem.MolFromSmiles(smiles)
-    if mol is None or not arrows:
+    if mol is None:
         return None
+    arrows = arrows or []
     if any(a < 1 or b < 1 or a > mol.GetNumAtoms() or b > mol.GetNumAtoms() for a, b, _ in arrows):
         return None
-    mol = Chem.Mol(mol)
-    AllChem.Compute2DCoords(mol)
-    for i, atom in enumerate(mol.GetAtoms(), 1):
-        atom.SetAtomMapNum(i)
+    mol = Chem.Mol(mol); AllChem.Compute2DCoords(mol)
+    for i, atom in enumerate(mol.GetAtoms(), 1): atom.SetAtomMapNum(i)
     w, h = 900, 650
     drawer = rdMolDraw2D.MolDraw2DSVG(w, h)
-    opts = drawer.drawOptions()
-    opts.addAtomIndices = False
-    opts.fixedBondLength = 55
-    opts.bondLineWidth = 2.2
+    opts = drawer.drawOptions(); opts.addAtomIndices = False; opts.fixedBondLength = 55; opts.bondLineWidth = 2.2
     rdMolDraw2D.PrepareAndDrawMolecule(drawer, mol)
     coords = [drawer.GetDrawCoords(i) for i in range(mol.GetNumAtoms())]
-    drawer.FinishDrawing()
-    raw = drawer.GetDrawingText()
-    insert = []
-    insert.append('<defs><marker id="pairArrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#141414"/></marker><marker id="fishArrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,4 L8,1 L6,4 L8,7 z" fill="#141414"/></marker></defs>')
+    drawer.FinishDrawing(); raw = drawer.GetDrawingText()
+    insert = ['<defs><marker id="pairArrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#141414"/></marker><marker id="fishArrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,4 L8,1 L6,4 L8,7 z" fill="#141414"/></marker></defs>']
     for start, end, electrons in arrows:
         p1, p2 = coords[start - 1], coords[end - 1]
-        dx, dy = p2.x - p1.x, p2.y - p1.y
-        length = max((dx * dx + dy * dy) ** 0.5, 1.0)
-        nx, ny = -dy / length, dx / length
-        bend = min(90.0, max(45.0, length * 0.35))
+        dx, dy = p2.x - p1.x, p2.y - p1.y; length = max((dx * dx + dy * dy) ** 0.5, 1.0)
+        nx, ny = -dy / length, dx / length; bend = min(90.0, max(45.0, length * 0.35))
         cx, cy = (p1.x + p2.x) / 2 + nx * bend, (p1.y + p2.y) / 2 + ny * bend
         marker = "pairArrow" if electrons == 2 else "fishArrow"
         insert.append(f'<path d="M {p1.x:.1f},{p1.y:.1f} Q {cx:.1f},{cy:.1f} {p2.x:.1f},{p2.y:.1f}" fill="none" stroke="#141414" stroke-width="2.4" marker-end="url(#{marker})"/>')
-    svg = raw.replace("</svg>", "".join(insert) + "</svg>")
-    return svg.encode("utf-8")
+    return raw.replace("</svg>", "".join(insert) + "</svg>").encode("utf-8")
