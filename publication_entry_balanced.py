@@ -157,6 +157,20 @@ def install_publication_renderer(app_module) -> None:
         equation = app_module.format_equation(reactant_terms, product_terms)
         small_as_formula = settings.structure_style != "skeletal"
 
+        final_hook = getattr(app_module, "_publication_final_reaction_hook", None)
+        if callable(final_hook):
+            try:
+                final_hook(
+                    user_id,
+                    reactant_terms,
+                    product_terms,
+                    reactant_pairs,
+                    product_pairs,
+                    equation,
+                )
+            except Exception as exc:
+                app_module.chem_logger.warning("Could not store final reaction state: %s", exc)
+
         png_task = asyncio.to_thread(
             pub.render_reaction_png,
             reactant_pairs,
@@ -167,33 +181,45 @@ def install_publication_renderer(app_module) -> None:
             arrow_style=settings.arrow_style,
             transparent_background=settings.transparent_background,
         )
-        svg_task = asyncio.to_thread(
-            pub.render_reaction_svg,
-            reactant_pairs,
-            product_pairs,
-            small_as_formula=small_as_formula,
-            arrow_top=arrow_top,
-            arrow_bottom=arrow_bottom,
-            arrow_style=settings.arrow_style,
-            transparent_background=settings.transparent_background,
-        )
-        cdxml_task = asyncio.to_thread(
-            generate_reaction_cdxml,
-            reactant_pairs,
-            product_pairs,
-            arrow_top=arrow_top,
-            arrow_bottom=arrow_bottom,
-            arrow_style=settings.arrow_style,
-            title=equation,
-        )
-        rxn_task = asyncio.to_thread(
-            app_module.generate_rxn_file,
-            [app_module.ReactionTerm(c, s) for c, s in reactant_pairs],
-            [app_module.ReactionTerm(c, s) for c, s in product_pairs],
-            "Reaction.rxn",
-            equation,
-        )
-        png_bytes, svg_bytes, cdxml_bytes, rxn_file = await asyncio.gather(png_task, svg_task, cdxml_task, rxn_task)
+
+        export_tasks: dict[str, object] = {"png": png_task}
+        if settings.export_svg:
+            export_tasks["svg"] = asyncio.to_thread(
+                pub.render_reaction_svg,
+                reactant_pairs,
+                product_pairs,
+                small_as_formula=small_as_formula,
+                arrow_top=arrow_top,
+                arrow_bottom=arrow_bottom,
+                arrow_style=settings.arrow_style,
+                transparent_background=settings.transparent_background,
+            )
+        if settings.export_cdxml:
+            export_tasks["cdxml"] = asyncio.to_thread(
+                generate_reaction_cdxml,
+                reactant_pairs,
+                product_pairs,
+                arrow_top=arrow_top,
+                arrow_bottom=arrow_bottom,
+                arrow_style=settings.arrow_style,
+                title=equation,
+            )
+        if settings.export_rxn:
+            export_tasks["rxn"] = asyncio.to_thread(
+                app_module.generate_rxn_file,
+                [app_module.ReactionTerm(c, s) for c, s in reactant_pairs],
+                [app_module.ReactionTerm(c, s) for c, s in product_pairs],
+                "Reaction.rxn",
+                equation,
+            )
+
+        keys = list(export_tasks)
+        values = await asyncio.gather(*(export_tasks[k] for k in keys))
+        exports = dict(zip(keys, values))
+        png_bytes = exports.get("png")
+        svg_bytes = exports.get("svg")
+        cdxml_bytes = exports.get("cdxml")
+        rxn_file = exports.get("rxn")
 
         caption_lines = ["<b>Reaction scheme</b>", f"<code>{html.escape(equation)}</code>"]
         if automatically_balanced:
