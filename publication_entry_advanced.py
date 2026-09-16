@@ -16,6 +16,7 @@ from telegram.ext import Application, CallbackQueryHandler, CommandHandler, Mess
 import advanced_chemistry_v2 as adv
 import chemistry_ui as ui
 import publication_entry_balanced as base
+import rxn_export
 
 
 _LAST_REACTION: dict[int, dict] = {}
@@ -35,6 +36,28 @@ def _format_redox_with_names(result: adv.RedoxResult, reactant_terms, product_te
 
 def install_publication_renderer(app_module) -> None:
     base.install_publication_renderer(app_module)
+
+    # Replace only the chemistry RXN exporter.  The established handlers keep
+    # their original call signature, while the new exporter preserves canonical
+    # per-molecule 2D orientation instead of re-laying out the whole reaction.
+    def generate_chemdraw_consistent_rxn(reactant_terms, product_terms, filename: str, title: str = ""):
+        reactant_pairs = [(term.coefficient, term.name) for term in reactant_terms]
+        product_pairs = [(term.coefficient, term.name) for term in product_terms]
+        return rxn_export.generate_chemdraw_rxn_file(
+            reactant_pairs,
+            product_pairs,
+            filename=filename,
+            title=title,
+        )
+
+    app_module.generate_rxn_file = generate_chemdraw_consistent_rxn
+    app_module.WELCOME_TEXT += (
+        "\n\n<b>RXN / ChemDraw note</b>\n"
+        "RXN now preserves the same canonical molecular orientation used by the publication renderer. "
+        "Classic MDL RXN does not store the complete page layout (arrow geometry, condition labels, or coefficient typography), "
+        "so use the SVG export when exact visual fidelity to the Telegram preview is required."
+    )
+
     old_handle_reaction = app_module._handle_reaction
 
     async def capture_reaction(update, status_msg, text: str, separator: str, index: int) -> None:
@@ -215,4 +238,6 @@ def install_publication_renderer(app_module) -> None:
     app_module._handle_reaction = capture_reaction
     app_module.chem_start_command = advanced_start
     app_module.run_chem_bot = run_chem_bot_advanced
-    app_module.chem_logger.info("Advanced chemistry engine installed conservatively without modifying ORCA/Flask.")
+    app_module.chem_logger.info(
+        "Advanced chemistry engine installed; ChemDraw-consistent canonical RXN exporter enabled without modifying ORCA/Flask."
+    )
