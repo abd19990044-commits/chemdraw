@@ -3,13 +3,13 @@ from __future__ import annotations
 """Production bootstrap.
 
 The original combined ORCA + Chemistry application is preserved byte-for-byte
-in ``legacy_app.py``. This bootstrap installs the publication-grade renderer
-and automatic stoichiometric balancer into the Chemistry Drawing Bot only,
-then starts the unchanged combined app.
+in ``legacy_app.py``. This bootstrap installs the publication-grade renderer,
+automatic stoichiometric balancing and conservative advanced chemistry tools
+into the Chemistry Drawing Bot only, then starts the unchanged combined app.
 """
 
 import legacy_app as core
-from publication_entry_balanced import install_publication_renderer
+from publication_entry_advanced import install_publication_renderer
 
 install_publication_renderer(core)
 
