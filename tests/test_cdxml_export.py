@@ -1,10 +1,23 @@
 from xml.etree import ElementTree as ET
 
-from cdxml_export import generate_reaction_cdxml
+from cdxml_export import generate_reaction_cdxml, generate_single_compound_cdxml
 
 
 def _arrow(root):
     return next(g for g in root.findall("page/graphic") if g.get("ArrowType"))
+
+
+def test_single_compound_cdxml_is_editable_fragment():
+    data = generate_single_compound_cdxml("CC(=O)OC1=CC=CC=C1C(=O)O", "Aspirin")
+    assert data is not None
+    root = ET.fromstring(data)
+    page = root.find("page")
+    assert page is not None
+    fragments = page.findall("fragment")
+    assert len(fragments) == 1
+    assert len(fragments[0].findall("n")) > 0
+    assert len(fragments[0].findall("b")) > 0
+    assert not page.findall("graphic")
 
 
 def test_cdxml_contains_editable_fragments_arrow_and_conditions():
