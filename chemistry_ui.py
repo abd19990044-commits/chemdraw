@@ -13,9 +13,9 @@ class ChemUserSettings:
     auto_balance: bool = True
     arrow_style: str = "forward"  # forward | equilibrium | reversible
     structure_style: str = "smart"  # smart | skeletal | condensed
-    # The Telegram photo preview is always produced. Extra raster/vector files
-    # are opt-in by default to keep CPU and outbound traffic low on Render Free.
-    export_png: bool = False
+    # PNG and editable CDXML are primary exports. SVG/TIFF/RXN remain optional
+    # so the free Render instance does not perform avoidable work by default.
+    export_png: bool = True
     export_svg: bool = False
     export_tiff: bool = False
     export_cdxml: bool = True
@@ -117,7 +117,7 @@ def settings_text(s: ChemUserSettings) -> str:
         f"PNG: {'ON' if s.export_png else 'OFF'} · SVG: {'ON' if s.export_svg else 'OFF'} · TIFF: {'ON' if s.export_tiff else 'OFF'}\n"
         f"CDXML (editable in ChemDraw): {'ON' if s.export_cdxml else 'OFF'} · "
         f"RXN compatibility: {'ON' if s.export_rxn else 'OFF'}\n\n"
-        "ℹ️ A PNG preview is always sent. Extra PNG/SVG/TIFF files are optional to keep the service responsive under load."
+        "ℹ️ PNG and CDXML are enabled by default. Heavy rendering jobs are queued to protect the free server under concurrent load."
     )
 
 
