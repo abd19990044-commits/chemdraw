@@ -25,6 +25,7 @@ from telegram.ext import (
 import chemistry_ui as ui
 import publication_entry as base
 import publication_renderer_v3 as pub
+import render_capacity as capacity
 from cdxml_export import generate_reaction_cdxml
 from reaction_balancer import balance_reaction_smiles
 
@@ -34,6 +35,10 @@ def _tiff_from_png(png_bytes: bytes, dpi: int = 600) -> bytes:
     out = io.BytesIO()
     src.save(out, format="TIFF", dpi=(dpi, dpi), compression="tiff_lzw")
     return out.getvalue()
+
+
+def _pairs_key(pairs) -> tuple:
+    return tuple((str(Fraction(c)), str(s)) for c, s in pairs)
 
 
 def install_publication_renderer(app_module) -> None:
@@ -160,32 +165,35 @@ def install_publication_renderer(app_module) -> None:
         final_hook = getattr(app_module, "_publication_final_reaction_hook", None)
         if callable(final_hook):
             try:
-                final_hook(
-                    user_id,
-                    reactant_terms,
-                    product_terms,
-                    reactant_pairs,
-                    product_pairs,
-                    equation,
-                )
+                final_hook(user_id, reactant_terms, product_terms, reactant_pairs, product_pairs, equation)
             except Exception as exc:
                 app_module.chem_logger.warning("Could not store final reaction state: %s", exc)
 
-        png_task = asyncio.to_thread(
-            pub.render_reaction_png,
-            reactant_pairs,
-            product_pairs,
-            small_as_formula=small_as_formula,
-            arrow_top=arrow_top,
-            arrow_bottom=arrow_bottom,
-            arrow_style=settings.arrow_style,
-            transparent_background=settings.transparent_background,
-        )
+        if not capacity.try_reserve():
+            snap = capacity.capacity_snapshot()
+            await status_msg.edit_text(
+                "⏳ The free server is currently processing many chemistry jobs. "
+                "Please retry shortly. Your request was rejected before rendering to protect the service from running out of memory."
+            )
+            app_module.chem_logger.warning("Chemistry render queue full: %s", snap)
+            return
 
-        export_tasks: dict[str, object] = {"png": png_task}
-        if settings.export_svg:
-            export_tasks["svg"] = asyncio.to_thread(
-                pub.render_reaction_svg,
+        try:
+            left_key = _pairs_key(reactant_pairs)
+            right_key = _pairs_key(product_pairs)
+            common_key = (
+                left_key,
+                right_key,
+                bool(small_as_formula),
+                str(arrow_top),
+                str(arrow_bottom),
+                str(settings.arrow_style),
+                bool(settings.transparent_background),
+            )
+
+            png_bytes = await capacity.run_cached_bytes(
+                ("png",) + common_key,
+                pub.render_reaction_png,
                 reactant_pairs,
                 product_pairs,
                 small_as_formula=small_as_formula,
@@ -194,32 +202,45 @@ def install_publication_renderer(app_module) -> None:
                 arrow_style=settings.arrow_style,
                 transparent_background=settings.transparent_background,
             )
-        if settings.export_cdxml:
-            export_tasks["cdxml"] = asyncio.to_thread(
-                generate_reaction_cdxml,
-                reactant_pairs,
-                product_pairs,
-                arrow_top=arrow_top,
-                arrow_bottom=arrow_bottom,
-                arrow_style=settings.arrow_style,
-                title=equation,
-            )
-        if settings.export_rxn:
-            export_tasks["rxn"] = asyncio.to_thread(
-                app_module.generate_rxn_file,
-                [app_module.ReactionTerm(c, s) for c, s in reactant_pairs],
-                [app_module.ReactionTerm(c, s) for c, s in product_pairs],
-                "Reaction.rxn",
-                equation,
-            )
 
-        keys = list(export_tasks)
-        values = await asyncio.gather(*(export_tasks[k] for k in keys))
-        exports = dict(zip(keys, values))
-        png_bytes = exports.get("png")
-        svg_bytes = exports.get("svg")
-        cdxml_bytes = exports.get("cdxml")
-        rxn_file = exports.get("rxn")
+            svg_bytes = None
+            if settings.export_svg:
+                svg_bytes = await capacity.run_cached_bytes(
+                    ("svg",) + common_key,
+                    pub.render_reaction_svg,
+                    reactant_pairs,
+                    product_pairs,
+                    small_as_formula=small_as_formula,
+                    arrow_top=arrow_top,
+                    arrow_bottom=arrow_bottom,
+                    arrow_style=settings.arrow_style,
+                    transparent_background=settings.transparent_background,
+                )
+
+            cdxml_bytes = None
+            if settings.export_cdxml:
+                cdxml_bytes = await capacity.run_cached_bytes(
+                    ("cdxml", left_key, right_key, str(arrow_top), str(arrow_bottom), str(settings.arrow_style)),
+                    generate_reaction_cdxml,
+                    reactant_pairs,
+                    product_pairs,
+                    arrow_top=arrow_top,
+                    arrow_bottom=arrow_bottom,
+                    arrow_style=settings.arrow_style,
+                    title=equation,
+                )
+
+            rxn_file = None
+            if settings.export_rxn:
+                rxn_file = await capacity.run_heavy(
+                    app_module.generate_rxn_file,
+                    [app_module.ReactionTerm(c, s) for c, s in reactant_pairs],
+                    [app_module.ReactionTerm(c, s) for c, s in product_pairs],
+                    "Reaction.rxn",
+                    equation,
+                )
+        finally:
+            capacity.release()
 
         caption_lines = ["<b>Reaction scheme</b>", f"<code>{html.escape(equation)}</code>"]
         if automatically_balanced:
@@ -255,7 +276,7 @@ def install_publication_renderer(app_module) -> None:
                 caption="Publication vector SVG — recommended for manuscripts and graphical editing",
             )
         if settings.export_tiff and png_bytes:
-            tiff_bytes = await asyncio.to_thread(_tiff_from_png, png_bytes, 600)
+            tiff_bytes = await capacity.run_heavy(_tiff_from_png, png_bytes, 600)
             await update.message.reply_document(
                 document=app_module.bytes_to_named_bytesio(tiff_bytes, "Reaction_600dpi.tiff"),
                 caption="Publication TIFF — 600 DPI (LZW)",
@@ -290,7 +311,7 @@ def install_publication_renderer(app_module) -> None:
         application.add_handler(CallbackQueryHandler(settings_callback, pattern=r"^chem:"))
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, interactive_run_message))
         application.add_error_handler(app_module.error_handler)
-        app_module.chem_logger.info("Interactive Chemistry Bot controls enabled and polling.")
+        app_module.chem_logger.info("Interactive Chemistry Bot controls enabled with bounded Render-free chemistry executor: %s", capacity.capacity_snapshot())
         application.run_polling(
             allowed_updates=Update.ALL_TYPES,
             drop_pending_updates=True,
@@ -303,5 +324,5 @@ def install_publication_renderer(app_module) -> None:
     app_module.run_chem_bot = run_chem_bot_interactive
     app_module.render_reaction_scheme = pub.render_reaction_scheme
     app_module.chem_logger.info(
-        "Professional chemistry UI enabled: CDXML primary editable export, optional RXN compatibility, PNG/SVG/TIFF."
+        "Professional chemistry UI enabled: CDXML primary editable export, bounded CPU rendering, optional RXN/PNG/SVG/TIFF."
     )
