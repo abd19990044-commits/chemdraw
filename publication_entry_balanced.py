@@ -1,31 +1,98 @@
 from __future__ import annotations
 
-"""Automatic-balancing integration for the publication chemistry bot.
+"""Interactive publication chemistry integration.
 
-This layer installs the existing publication renderer first, then replaces only
-its reaction handler.  ORCA/Flask and the legacy application remain untouched.
+Installs the established publication parser/resolver, automatic stoichiometric
+balancer and a professional Telegram inline-control layer. ORCA/Flask remains
+untouched in legacy_app.py.
 """
 
 import asyncio
 import html
+import io
 from fractions import Fraction
 
+from PIL import Image
+from telegram import Update
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    MessageHandler,
+    filters,
+)
+
+import chemistry_ui as ui
 import publication_entry as base
-import publication_renderer_v2 as pub
+import publication_renderer_v3 as pub
 from reaction_balancer import balance_reaction_smiles
 
 
+def _tiff_from_png(png_bytes: bytes, dpi: int = 600) -> bytes:
+    src = Image.open(io.BytesIO(png_bytes))
+    out = io.BytesIO()
+    src.save(out, format="TIFF", dpi=(dpi, dpi), compression="tiff_lzw")
+    return out.getvalue()
+
+
 def install_publication_renderer(app_module) -> None:
-    # Install all established publication features first: parser, name handling,
-    # SVG/PNG renderer, welcome text, etc.
+    # Install parser/name-resolution/publication groundwork first.
     base.install_publication_renderer(app_module)
 
-    # Advertise the new capability without changing the private/general examples.
-    app_module.WELCOME_TEXT = app_module.WELCOME_TEXT.replace(
-        "• Automatic element/charge balance check",
-        "• Automatic stoichiometric equation balancing (elements + charge)\n"
-        "• Automatic element/charge balance verification",
+    app_module.WELCOME_TEXT = (
+        "🧪 <b>Chemistry Drawing Bot — Publication Edition</b>\n\n"
+        "Create publication-ready chemical structures and reaction schemes from names, SMILES, InChI, CAS RN, or ordinary equations.\n\n"
+        "<b>Quick examples</b>\n"
+        "<code>H2 + O2 = H2O</code>\n"
+        "<code>Ethene + H2 = Ethane || Ni | 150 °C</code>\n\n"
+        "<b>Research features</b>\n"
+        "• Automatic stoichiometric balancing using elements and formal charge\n"
+        "• Forward, equilibrium and reversible reaction arrows\n"
+        "• Smart condensed/skeletal molecular depiction\n"
+        "• Reaction conditions above and below the arrow\n"
+        "• SVG vector, 600 DPI PNG, 600 DPI TIFF and editable RXN exports\n"
+        "• Optional transparent publication background\n"
+        "• Element/charge balance verification\n\n"
+        "Use the buttons below to configure your drawing preferences."
     )
+
+    async def interactive_start(update, context) -> None:
+        user_id = update.effective_user.id if update.effective_user else None
+        app_module.chem_logger.info("/start from user %s", user_id or "unknown")
+        asyncio.create_task(app_module.notify_admin(update, context))
+        await update.message.reply_text(
+            app_module.WELCOME_TEXT,
+            parse_mode="HTML",
+            reply_markup=ui.welcome_keyboard(user_id),
+        )
+
+    async def settings_callback(update, context) -> None:
+        query = update.callback_query
+        if query is None:
+            return
+        await query.answer()
+        user_id = update.effective_user.id if update.effective_user else 0
+        data = query.data or ""
+        action = data.split(":", 1)[1] if ":" in data else "settings"
+
+        if action == "help":
+            await query.edit_message_text(
+                ui.help_text(),
+                parse_mode="HTML",
+                reply_markup=ui.settings_keyboard(ui.get_settings(user_id)),
+            )
+            return
+
+        if action in {"settings", "exports"}:
+            settings = ui.get_settings(user_id)
+        else:
+            settings = ui.apply_action(user_id, action)
+
+        await query.edit_message_text(
+            ui.settings_text(settings),
+            parse_mode="HTML",
+            reply_markup=ui.settings_keyboard(settings),
+        )
 
     async def publication_handle_reaction_balanced(
         update,
@@ -34,6 +101,9 @@ def install_publication_renderer(app_module) -> None:
         separator: str,
         index: int,
     ) -> None:
+        user_id = update.effective_user.id if update.effective_user else None
+        settings = ui.get_settings(user_id)
+
         reaction_text, arrow_top, arrow_bottom = base._extract_conditions(text)
         sep_info = app_module.find_reaction_separator(reaction_text)
         if not sep_info:
@@ -51,112 +121,86 @@ def install_publication_renderer(app_module) -> None:
         reactant_terms = app_module.split_compound_terms(left)
         product_terms = app_module.split_compound_terms(right)
         if not reactant_terms or not product_terms:
-            await status_msg.edit_text(
-                "⚠️ Please provide at least one compound on each side of the reaction."
-            )
+            await status_msg.edit_text("⚠️ Please provide at least one compound on each side of the reaction.")
             return
 
         reactant_resolved, reactant_notes = await app_module._resolve_terms(reactant_terms)
         product_resolved, product_notes = await app_module._resolve_terms(product_terms)
 
-        unresolved = [
-            term.name
-            for term, (_, smiles) in zip(reactant_terms, reactant_resolved)
-            if smiles is None
-        ]
-        unresolved += [
-            term.name
-            for term, (_, smiles) in zip(product_terms, product_resolved)
-            if smiles is None
-        ]
+        unresolved = [term.name for term, (_, smiles) in zip(reactant_terms, reactant_resolved) if smiles is None]
+        unresolved += [term.name for term, (_, smiles) in zip(product_terms, product_resolved) if smiles is None]
         if unresolved:
             joined = ", ".join(html.escape(name) for name in dict.fromkeys(unresolved))
-            await status_msg.edit_text(
-                app_module.NOT_FOUND_TEXT.format(name=joined),
-                parse_mode="HTML",
-            )
+            await status_msg.edit_text(app_module.NOT_FOUND_TEXT.format(name=joined), parse_mode="HTML")
             return
 
         reactant_pairs = [(coef, smiles) for coef, smiles in reactant_resolved]
         product_pairs = [(coef, smiles) for coef, smiles in product_resolved]
         original_balance = app_module.check_reaction_balance(reactant_pairs, product_pairs)
-
+        balance = original_balance
         balance_notice = ""
         automatically_balanced = False
 
-        if original_balance.get("checked") and original_balance.get("balanced"):
-            balance_notice = "✅ Equation was already balanced; the entered coefficients were preserved."
-        else:
-            solution = balance_reaction_smiles(
-                [smiles for _, smiles in reactant_pairs],
-                [smiles for _, smiles in product_pairs],
-            )
-            if solution is not None:
-                left_coeffs, right_coeffs = solution
-                reactant_pairs = [
-                    (Fraction(coef), smiles)
-                    for coef, (_, smiles) in zip(left_coeffs, reactant_pairs)
-                ]
-                product_pairs = [
-                    (Fraction(coef), smiles)
-                    for coef, (_, smiles) in zip(right_coeffs, product_pairs)
-                ]
-                reactant_terms = [
-                    app_module.ReactionTerm(Fraction(coef), term.name)
-                    for coef, term in zip(left_coeffs, reactant_terms)
-                ]
-                product_terms = [
-                    app_module.ReactionTerm(Fraction(coef), term.name)
-                    for coef, term in zip(right_coeffs, product_terms)
-                ]
-                verified = app_module.check_reaction_balance(reactant_pairs, product_pairs)
-                if verified.get("checked") and verified.get("balanced"):
-                    automatically_balanced = True
-                    balance_notice = "✅ Equation automatically balanced by the bot using the smallest whole-number coefficients."
-                    balance = verified
-                else:
-                    balance = original_balance
-                    balance_notice = (
-                        "⚠️ Automatic balancing was attempted but could not be independently verified; "
-                        "the entered coefficients were retained."
-                    )
+        if settings.auto_balance:
+            if original_balance.get("checked") and original_balance.get("balanced"):
+                balance_notice = "✅ Equation was already balanced; the entered coefficients were preserved."
             else:
-                balance = original_balance
-                balance_notice = (
-                    "⚠️ Automatic balancing was not applied because a unique positive stoichiometric "
-                    "solution could not be determined from the entered species."
+                solution = balance_reaction_smiles(
+                    [smiles for _, smiles in reactant_pairs],
+                    [smiles for _, smiles in product_pairs],
                 )
-
-        if original_balance.get("checked") and original_balance.get("balanced"):
-            balance = original_balance
+                if solution is not None:
+                    left_coeffs, right_coeffs = solution
+                    new_reactants = [(Fraction(c), smi) for c, (_, smi) in zip(left_coeffs, reactant_pairs)]
+                    new_products = [(Fraction(c), smi) for c, (_, smi) in zip(right_coeffs, product_pairs)]
+                    verified = app_module.check_reaction_balance(new_reactants, new_products)
+                    if verified.get("checked") and verified.get("balanced"):
+                        reactant_pairs, product_pairs = new_reactants, new_products
+                        reactant_terms = [app_module.ReactionTerm(Fraction(c), t.name) for c, t in zip(left_coeffs, reactant_terms)]
+                        product_terms = [app_module.ReactionTerm(Fraction(c), t.name) for c, t in zip(right_coeffs, product_terms)]
+                        balance = verified
+                        automatically_balanced = True
+                        balance_notice = "✅ Equation automatically balanced by the bot using the smallest whole-number coefficients."
+                    else:
+                        balance_notice = "⚠️ Automatic balancing could not be independently verified; entered coefficients were retained."
+                else:
+                    balance_notice = "⚠️ No unique positive stoichiometric solution was found from the entered species; coefficients were retained."
+        else:
+            balance_notice = "ℹ️ Automatic balancing is disabled in your drawing settings."
 
         equation = app_module.format_equation(reactant_terms, product_terms)
+        small_as_formula = settings.structure_style != "skeletal"
 
-        png_bytes, svg_bytes, rxn_file = await asyncio.gather(
-            asyncio.to_thread(
-                pub.render_reaction_png,
-                reactant_pairs,
-                product_pairs,
-                arrow_top=arrow_top,
-                arrow_bottom=arrow_bottom,
-            ),
-            asyncio.to_thread(
-                pub.render_reaction_svg,
-                reactant_pairs,
-                product_pairs,
-                arrow_top=arrow_top,
-                arrow_bottom=arrow_bottom,
-            ),
-            asyncio.to_thread(
-                app_module.generate_rxn_file,
-                [app_module.ReactionTerm(coef, smiles) for coef, smiles in reactant_pairs],
-                [app_module.ReactionTerm(coef, smiles) for coef, smiles in product_pairs],
-                "Reaction.rxn",
-                equation,
-            ),
+        png_task = asyncio.to_thread(
+            pub.render_reaction_png,
+            reactant_pairs,
+            product_pairs,
+            small_as_formula=small_as_formula,
+            arrow_top=arrow_top,
+            arrow_bottom=arrow_bottom,
+            arrow_style=settings.arrow_style,
+            transparent_background=settings.transparent_background,
         )
+        svg_task = asyncio.to_thread(
+            pub.render_reaction_svg,
+            reactant_pairs,
+            product_pairs,
+            small_as_formula=small_as_formula,
+            arrow_top=arrow_top,
+            arrow_bottom=arrow_bottom,
+            arrow_style=settings.arrow_style,
+            transparent_background=settings.transparent_background,
+        )
+        rxn_task = asyncio.to_thread(
+            app_module.generate_rxn_file,
+            [app_module.ReactionTerm(c, s) for c, s in reactant_pairs],
+            [app_module.ReactionTerm(c, s) for c, s in product_pairs],
+            "Reaction.rxn",
+            equation,
+        )
+        png_bytes, svg_bytes, rxn_file = await asyncio.gather(png_task, svg_task, rxn_task)
 
-        caption_lines = ["Reaction scheme:", f"<code>{html.escape(equation)}</code>"]
+        caption_lines = ["<b>Reaction scheme</b>", f"<code>{html.escape(equation)}</code>"]
         if automatically_balanced:
             caption_lines.append("<b>✅ Equation automatically balanced by the bot.</b>")
         elif balance_notice:
@@ -165,55 +209,83 @@ def install_publication_renderer(app_module) -> None:
             caption_lines.append("Conditions: " + html.escape(arrow_top))
         if arrow_bottom:
             caption_lines.append("Additional conditions: " + html.escape(arrow_bottom))
-        if balance.get("checked"):
+        if settings.show_balance_report and balance.get("checked"):
             caption_lines.append(html.escape(balance["message"]))
         for note in (reactant_notes + product_notes)[:3]:
             caption_lines.append("ℹ️ " + html.escape(note))
         caption = "\n".join(caption_lines)
 
+        # Always send a visual preview; export toggles control document files.
         if png_bytes:
-            preview = app_module.bytes_to_named_bytesio(png_bytes, "Reaction_600dpi.png")
+            preview = app_module.bytes_to_named_bytesio(png_bytes, "Reaction_preview.png")
             await update.message.reply_photo(
                 photo=preview,
                 caption=caption,
                 parse_mode="HTML",
-            )
-            png_document = app_module.bytes_to_named_bytesio(
-                png_bytes,
-                "Reaction_600dpi.png",
-            )
-            await update.message.reply_document(
-                document=png_document,
-                caption=(
-                    "Publication PNG (600 DPI; original resolution)"
-                    + (" — automatically balanced" if automatically_balanced else "")
-                ),
+                reply_markup=ui.welcome_keyboard(user_id),
             )
 
-        if svg_bytes:
-            svg_document = app_module.bytes_to_named_bytesio(
-                svg_bytes,
-                "Reaction_vector.svg",
-            )
+        if settings.export_png and png_bytes:
             await update.message.reply_document(
-                document=svg_document,
-                caption=(
-                    "Publication vector SVG — recommended for manuscripts and graphical editing"
-                    + (" — automatically balanced" if automatically_balanced else "")
-                ),
+                document=app_module.bytes_to_named_bytesio(png_bytes, "Reaction_600dpi.png"),
+                caption="Publication PNG — 600 DPI",
             )
 
-        if rxn_file:
+        if settings.export_svg and svg_bytes:
+            await update.message.reply_document(
+                document=app_module.bytes_to_named_bytesio(svg_bytes, "Reaction_vector.svg"),
+                caption="Publication vector SVG — recommended for manuscripts and editing",
+            )
+
+        if settings.export_tiff and png_bytes:
+            tiff_bytes = await asyncio.to_thread(_tiff_from_png, png_bytes, 600)
+            await update.message.reply_document(
+                document=app_module.bytes_to_named_bytesio(tiff_bytes, "Reaction_600dpi.tiff"),
+                caption="Publication TIFF — 600 DPI (LZW)",
+            )
+
+        if settings.export_rxn and rxn_file:
             await update.message.reply_document(
                 document=rxn_file,
-                caption=(
-                    "Editable reaction file (.rxn)"
-                    + (" — automatically balanced" if automatically_balanced else "")
-                ),
+                caption="Editable MDL reaction file (.rxn)",
             )
+
         await status_msg.delete()
 
+    async def interactive_run_message(update, context) -> None:
+        # Preserve the established text-processing flow while using the patched
+        # reaction handler above and current per-user settings.
+        await app_module.handle_chemical_message(update, context)
+
+    def run_chem_bot_interactive() -> None:
+        if not app_module.CHEM_BOT_TOKEN:
+            app_module.chem_logger.error("CRITICAL: CHEM_BOT_TOKEN is not set. Chemistry bot will NOT start.")
+            return
+
+        application = (
+            Application.builder()
+            .token(app_module.CHEM_BOT_TOKEN)
+            .post_init(app_module._on_startup)
+            .post_shutdown(app_module._on_shutdown)
+            .build()
+        )
+        application.add_handler(CommandHandler(["start", "help"], interactive_start))
+        application.add_handler(CallbackQueryHandler(settings_callback, pattern=r"^chem:"))
+        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, interactive_run_message))
+        application.add_error_handler(app_module.error_handler)
+        app_module.chem_logger.info("Interactive Chemistry Bot controls enabled and polling.")
+        application.run_polling(
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=True,
+            stop_signals=None,
+            close_loop=False,
+        )
+
+    # Chemistry Drawing Bot call points only.
+    app_module.chem_start_command = interactive_start
     app_module._handle_reaction = publication_handle_reaction_balanced
+    app_module.run_chem_bot = run_chem_bot_interactive
+    app_module.render_reaction_scheme = pub.render_reaction_scheme
     app_module.chem_logger.info(
-        "Automatic stoichiometric balancer enabled: elements + formal charge, exact integer coefficients."
+        "Professional chemistry UI enabled: per-user settings, arrow styles, auto-balance, PNG/SVG/TIFF/RXN exports."
     )
