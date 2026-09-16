@@ -13,7 +13,7 @@ import html
 from telegram import Update
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, MessageHandler, filters
 
-import advanced_chemistry as adv
+import advanced_chemistry_v2 as adv
 import chemistry_ui as ui
 import publication_entry_balanced as base
 
@@ -34,13 +34,10 @@ def _format_redox_with_names(result: adv.RedoxResult, reactant_terms, product_te
 
 
 def install_publication_renderer(app_module) -> None:
-    # Install all publication, interactive UI, renderer and automatic-balancing features first.
     base.install_publication_renderer(app_module)
-
     old_handle_reaction = app_module._handle_reaction
 
     async def capture_reaction(update, status_msg, text: str, separator: str, index: int) -> None:
-        """Store a resolved copy of the user's latest reaction, then use normal rendering flow."""
         user_id = update.effective_user.id if update.effective_user else 0
         try:
             reaction_text, _, _ = __import__("publication_entry")._extract_conditions(text)
@@ -82,7 +79,6 @@ def install_publication_renderer(app_module) -> None:
         if action == "mechanism_help":
             await query.edit_message_text(ui.mechanism_help_text(), parse_mode="HTML", reply_markup=ui.advanced_keyboard())
             return True
-
         if action not in {"redox_acidic", "redox_basic", "net_ionic", "atom_map"}:
             return False
         cached = _LAST_REACTION.get(int(user_id))
@@ -152,7 +148,6 @@ def install_publication_renderer(app_module) -> None:
         user_id = update.effective_user.id if update.effective_user else 0
         data = query.data or ""
         action = data.split(":", 1)[1] if ":" in data else "settings"
-
         if await _advanced_action(query, user_id, action):
             return
         if action == "help":
@@ -182,11 +177,7 @@ def install_publication_renderer(app_module) -> None:
         if svg is None:
             await update.message.reply_text("⚠️ The mechanism structure or atom indices could not be interpreted.")
             return
-        caption = (
-            "Atom-numbered mechanism structure."
-            if not arrows
-            else "User-directed curved-arrow mechanism. No electron flow was inferred automatically."
-        )
+        caption = "Atom-numbered mechanism structure." if not arrows else "User-directed curved-arrow mechanism. No electron flow was inferred automatically."
         await update.message.reply_document(
             document=app_module.bytes_to_named_bytesio(svg, "Mechanism_vector.svg"),
             caption=caption,
