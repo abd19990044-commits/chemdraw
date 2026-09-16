@@ -1,12 +1,8 @@
 from __future__ import annotations
 
-"""Interactive UI and per-user rendering preferences for Chemistry Drawing Bot.
+"""Interactive UI and per-user rendering preferences for Chemistry Drawing Bot."""
 
-Kept deliberately separate from the ORCA bot.  The module only depends on
-python-telegram-bot UI classes and stores lightweight user preferences in memory.
-"""
-
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from typing import Dict
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
@@ -38,6 +34,21 @@ def _mark(v: bool) -> str:
     return "✅" if v else "▫️"
 
 
+def advanced_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("⚡ Redox · acidic", callback_data="chem:redox_acidic"),
+            InlineKeyboardButton("⚡ Redox · basic", callback_data="chem:redox_basic"),
+        ],
+        [
+            InlineKeyboardButton("🧂 Net ionic", callback_data="chem:net_ionic"),
+            InlineKeyboardButton("🔢 Atom mapping", callback_data="chem:atom_map"),
+        ],
+        [InlineKeyboardButton("↪️ Curved-arrow mechanism", callback_data="chem:mechanism_help")],
+        [InlineKeyboardButton("⬅️ Drawing settings", callback_data="chem:settings")],
+    ])
+
+
 def settings_keyboard(settings: ChemUserSettings) -> InlineKeyboardMarkup:
     arrow_label = {
         "forward": "→ Forward",
@@ -65,12 +76,8 @@ def settings_keyboard(settings: ChemUserSettings) -> InlineKeyboardMarkup:
             InlineKeyboardButton(f"{_mark(settings.export_tiff)} TIFF", callback_data="chem:tiff"),
             InlineKeyboardButton(f"{_mark(settings.export_rxn)} RXN", callback_data="chem:rxn"),
         ],
-        [
-            InlineKeyboardButton(
-                f"{_mark(settings.transparent_background)} Transparent background",
-                callback_data="chem:transparent",
-            )
-        ],
+        [InlineKeyboardButton(f"{_mark(settings.transparent_background)} Transparent background", callback_data="chem:transparent")],
+        [InlineKeyboardButton("🧪 Advanced chemistry", callback_data="chem:advanced")],
         [
             InlineKeyboardButton("⚗️ Reaction help", callback_data="chem:help"),
             InlineKeyboardButton("↩️ Reset settings", callback_data="chem:reset"),
@@ -82,6 +89,7 @@ def welcome_keyboard(user_id: int | None) -> InlineKeyboardMarkup:
     s = get_settings(user_id)
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("⚙️ Drawing settings", callback_data="chem:settings")],
+        [InlineKeyboardButton("🧪 Advanced chemistry", callback_data="chem:advanced")],
         [
             InlineKeyboardButton(f"{_mark(s.auto_balance)} Auto-balance", callback_data="chem:balance"),
             InlineKeyboardButton("📤 Export options", callback_data="chem:exports"),
@@ -105,6 +113,30 @@ def settings_text(s: ChemUserSettings) -> str:
     )
 
 
+def advanced_text() -> str:
+    return (
+        "🧪 <b>Advanced Chemistry</b>\n\n"
+        "The actions below operate on your most recently drawn reaction.\n\n"
+        "⚡ <b>Redox balancing</b> — may add only H2O/H+/e− in acidic medium or H2O/OH−/e− in basic medium.\n"
+        "🧂 <b>Net ionic</b> — dissociates only explicitly supported strong electrolytes and cancels spectator ions.\n"
+        "🔢 <b>Atom mapping</b> — conservative 1→1 mapping only when the maximum common substructure is unique.\n"
+        "↪️ <b>Mechanism</b> — user-directed curved arrows; the bot never guesses electron flow."
+    )
+
+
+def mechanism_help_text() -> str:
+    return (
+        "↪️ <b>Curved-arrow mechanism mode</b>\n\n"
+        "Use an explicit SMILES followed by atom-to-atom electron-flow instructions:\n"
+        "<code>/mechanism CCO || 1-&gt;2</code>\n\n"
+        "For more than one arrow:\n"
+        "<code>/mechanism CCO || 1-&gt;2,3~&gt;2</code>\n\n"
+        "<code>-&gt;</code> = electron-pair arrow\n"
+        "<code>~&gt;</code> = single-electron (fishhook) arrow\n\n"
+        "Atom numbers are the RDKit atom order shown on the generated mechanism structure. The bot draws only the arrows you specify."
+    )
+
+
 def help_text() -> str:
     return (
         "⚗️ <b>Reaction syntax</b>\n\n"
@@ -112,7 +144,7 @@ def help_text() -> str:
         "Conditions above the arrow:\n<code>Ethene + H2 = Ethane || Ni</code>\n\n"
         "Above and below the arrow:\n<code>Ethene + H2 = Ethane || Ni | 150 °C</code>\n\n"
         "The bot can automatically calculate the smallest whole-number stoichiometric coefficients. "
-        "It never invents missing chemical species merely to force a balance."
+        "Advanced chemistry tools are available from the 🧪 button."
     )
 
 
