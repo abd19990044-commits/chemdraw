@@ -29,9 +29,14 @@ def _prepare_mol(smiles: str) -> Chem.Mol | None:
     if mol is None:
         return None
     mol = Chem.Mol(mol)
+    Chem.AssignStereochemistry(mol, cleanIt=True, force=True)
     rdDepictor.Compute2DCoords(mol, canonOrient=True, clearConfs=True)
     try:
         rdDepictor.StraightenDepiction(mol, minimizeRotation=True)
+    except Exception:
+        pass
+    try:
+        Chem.WedgeMolBonds(mol, mol.GetConformer())
     except Exception:
         pass
     return mol
@@ -109,6 +114,10 @@ def _add_fragment(page: ET.Element, obj_id: int, mol: Chem.Mol, x0: float, cente
             attrs["Display"] = "WedgeBegin"
         elif direction == Chem.BondDir.BEGINDASH:
             attrs["Display"] = "WedgedHashBegin"
+        elif direction == Chem.BondDir.ENDUPRIGHT:
+            attrs["Display"] = "WedgeEnd"
+        elif direction == Chem.BondDir.ENDDOWNRIGHT:
+            attrs["Display"] = "WedgedHashEnd"
         ET.SubElement(frag, "b", attrs)
         obj_id += 1
 
