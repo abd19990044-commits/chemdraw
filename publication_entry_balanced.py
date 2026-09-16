@@ -232,7 +232,7 @@ def install_publication_renderer(app_module) -> None:
             cdxml_bytes = None
             if settings.export_cdxml:
                 cdxml_bytes = await capacity.run_cached_bytes(
-                    ("cdxml", left_key, right_key, str(arrow_top), str(arrow_bottom), str(settings.arrow_style)),
+                    ("cdxml", left_key, right_key, bool(small_as_formula), str(arrow_top), str(arrow_bottom), str(settings.arrow_style)),
                     generate_reaction_cdxml,
                     reactant_pairs,
                     product_pairs,
@@ -240,6 +240,7 @@ def install_publication_renderer(app_module) -> None:
                     arrow_bottom=arrow_bottom,
                     arrow_style=settings.arrow_style,
                     title=equation,
+                    small_as_formula=small_as_formula,
                 )
 
             rxn_file = None
