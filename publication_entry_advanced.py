@@ -2,9 +2,9 @@ from __future__ import annotations
 
 """Advanced chemistry integration layer.
 
-Adds conservative redox balancing, net-ionic reduction, atom mapping and
-user-directed curved-arrow mechanisms on top of the interactive publication bot.
-The legacy ORCA application remains untouched.
+Adds conservative redox balancing, net-ionic reduction, atom mapping,
+user-directed curved-arrow mechanisms, and the publication single-compound
+pipeline on top of the interactive chemistry bot. ORCA/Flask remains untouched.
 """
 
 import asyncio
@@ -18,6 +18,7 @@ import chemistry_ui as ui
 import publication_entry_balanced as base
 import render_capacity as capacity
 import rxn_export
+from single_compound_pipeline import install_single_compound_pipeline
 
 
 _LAST_REACTION: dict[int, dict] = {}
@@ -37,6 +38,7 @@ def _format_redox_with_names(result: adv.RedoxResult, reactant_terms, product_te
 
 def install_publication_renderer(app_module) -> None:
     base.install_publication_renderer(app_module)
+    install_single_compound_pipeline(app_module)
 
     def generate_chemdraw_consistent_rxn(reactant_terms, product_terms, filename: str, title: str = ""):
         reactant_pairs = [(term.coefficient, term.name) for term in reactant_terms]
@@ -227,5 +229,5 @@ def install_publication_renderer(app_module) -> None:
     app_module.chem_start_command = advanced_start
     app_module.run_chem_bot = run_chem_bot_advanced
     app_module.chem_logger.info(
-        "Advanced chemistry engine installed; final balanced state and bounded Render-free worker are active without modifying ORCA/Flask."
+        "Advanced chemistry and single-compound PubChem 3D pipeline installed without modifying ORCA/Flask."
     )
