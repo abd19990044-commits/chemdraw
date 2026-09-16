@@ -1,0 +1,43 @@
+from xml.etree import ElementTree as ET
+
+from cdxml_export import generate_reaction_cdxml
+
+
+def test_cdxml_contains_editable_fragments_arrow_and_conditions():
+    data = generate_reaction_cdxml(
+        [(2, "[H][H]"), (1, "O=O")],
+        [(2, "O")],
+        arrow_top="catalyst",
+        arrow_bottom="25 °C",
+        arrow_style="forward",
+        title="2 H2 + O2 -> 2 H2O",
+    )
+    assert data is not None
+    root = ET.fromstring(data)
+    assert root.tag == "CDXML"
+    page = root.find("page")
+    assert page is not None
+    fragments = page.findall("fragment")
+    assert len(fragments) == 3
+    assert sum(len(f.findall("n")) for f in fragments) > 0
+    assert sum(len(f.findall("b")) for f in fragments) > 0
+    graphics = page.findall("graphic")
+    assert len(graphics) == 1
+    assert graphics[0].get("ArrowType") == "FullHead"
+    texts = ["".join(t.itertext()) for t in page.findall("t")]
+    assert "2" in texts
+    assert "catalyst" in texts
+    assert "25 °C" in texts
+
+
+def test_cdxml_equilibrium_arrow():
+    data = generate_reaction_cdxml(
+        [(1, "CC=O")],
+        [(1, "CC=O")],
+        arrow_style="equilibrium",
+    )
+    assert data is not None
+    root = ET.fromstring(data)
+    graphic = root.find("page/graphic")
+    assert graphic is not None
+    assert graphic.get("ArrowType") == "Equilibrium"
