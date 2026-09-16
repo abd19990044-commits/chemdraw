@@ -1,14 +1,26 @@
-name: Publication Renderer Tests
+name: Chemistry Publication Bot Tests
 
 on:
   push:
     branches:
+      - main
       - feature/publication-reaction-renderer
+    paths:
+      - 'app.py'
+      - 'publication_renderer*.py'
+      - 'publication_entry*.py'
+      - 'reaction_balancer.py'
+      - 'chemistry_ui.py'
+      - 'tests/**'
+      - '.github/workflows/publication-renderer-tests.yml'
   pull_request:
     paths:
-      - 'publication_renderer.py'
-      - 'publication_entry.py'
-      - 'tests/test_publication_renderer.py'
+      - 'app.py'
+      - 'publication_renderer*.py'
+      - 'publication_entry*.py'
+      - 'reaction_balancer.py'
+      - 'chemistry_ui.py'
+      - 'tests/**'
       - '.github/workflows/publication-renderer-tests.yml'
 
 jobs:
@@ -33,9 +45,13 @@ jobs:
           pip install -r requirements.txt
           pip install pytest
 
-      - name: Syntax check
+      - name: Syntax check production modules
         run: |
-          python -m py_compile publication_renderer.py publication_entry.py app.py
+          python -m py_compile \
+            app.py legacy_app.py \
+            publication_renderer.py publication_renderer_v2.py publication_renderer_v3.py \
+            publication_entry.py publication_entry_balanced.py \
+            reaction_balancer.py chemistry_ui.py
 
       - name: Run regression suite
-        run: pytest -q tests/test_publication_renderer.py
+        run: pytest -q tests
