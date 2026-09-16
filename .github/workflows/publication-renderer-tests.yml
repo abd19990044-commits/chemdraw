@@ -10,6 +10,7 @@ on:
       - 'publication_renderer*.py'
       - 'publication_entry*.py'
       - 'reaction_balancer.py'
+      - 'advanced_chemistry.py'
       - 'chemistry_ui.py'
       - 'tests/**'
       - '.github/workflows/publication-renderer-tests.yml'
@@ -19,6 +20,7 @@ on:
       - 'publication_renderer*.py'
       - 'publication_entry*.py'
       - 'reaction_balancer.py'
+      - 'advanced_chemistry.py'
       - 'chemistry_ui.py'
       - 'tests/**'
       - '.github/workflows/publication-renderer-tests.yml'
@@ -50,8 +52,8 @@ jobs:
           python -m py_compile \
             app.py legacy_app.py \
             publication_renderer.py publication_renderer_v2.py publication_renderer_v3.py \
-            publication_entry.py publication_entry_balanced.py \
-            reaction_balancer.py chemistry_ui.py
+            publication_entry.py publication_entry_balanced.py publication_entry_advanced.py \
+            reaction_balancer.py advanced_chemistry.py chemistry_ui.py
 
       - name: Run regression suite
         run: pytest -q tests
