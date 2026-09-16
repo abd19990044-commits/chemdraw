@@ -139,39 +139,22 @@ def _publication_reaction_separator(text: str, original_finder):
 
 
 def _looks_like_plain_chemical_name(token: str) -> bool:
-    """Conservatively identify tokens that should not be probed as SMILES.
-
-    This is intentionally narrow: obvious SMILES punctuation still goes through
-    the legacy detector, while ordinary words and locant-style names such as
-    ``2-methylbutane`` are treated as names without making RDKit emit parse
-    errors into production logs.
-    """
+    """Conservatively identify tokens that should not be probed as SMILES."""
     s = (token or "").strip()
     if not s or " " in s:
         return True
-
-    # Obvious structure syntax should remain eligible for SMILES detection.
     if re.search(r"[\[\]()=#@/\\.%:]", s):
         return False
-
-    # Locant/name style: digit(s)-word..., e.g. 2-methylbutane.
     if re.fullmatch(r"\d+(?:,\d+)*-[A-Za-z][A-Za-z0-9-]*", s):
         return True
-
-    # Hyphenated alphabetic words are overwhelmingly chemical names here.
     if "-" in s and re.fullmatch(r"[A-Za-z][A-Za-z0-9-]*", s):
         return True
-
-    # Plain words containing letters impossible in ordinary organic-subset
-    # SMILES are names. Keep compact valid-looking strings such as CCO/CN for
-    # the legacy SMILES detector.
     if re.fullmatch(r"[A-Za-z]+", s):
         smiles_letters = set("BCNOPSFIHclbrnospa")
         if any(ch not in smiles_letters for ch in s):
             return True
         if len(s) > 5 and any(ch.islower() for ch in s):
             return True
-
     return False
 
 
@@ -183,6 +166,7 @@ def install_publication_renderer(app_module) -> None:
 
     original_find_reaction_separator = app_module.find_reaction_separator
     original_detect_input_kind = app_module.detect_input_kind
+    original_resolve_species = app_module.resolve_species
 
     def publication_find_reaction_separator(text: str):
         return _publication_reaction_separator(text, original_find_reaction_separator)
@@ -196,6 +180,21 @@ def install_publication_renderer(app_module) -> None:
         if _looks_like_plain_chemical_name(stripped):
             return app_module.InputKind.NAME
         return original_detect_input_kind(stripped)
+
+    async def publication_resolve_species(token: str):
+        """Resolve verified local aliases before generic remote name probing."""
+        raw = (token or "").strip()
+        alias_key = re.sub(r"\s+", " ", raw).strip().lower()
+        alias = app_module.LOCAL_ALIASES.get(alias_key)
+        if alias:
+            source, value = alias
+            if source == "cid":
+                smiles = await app_module.pubchem_client.get_canonical_smiles_by_cid(value)
+            else:
+                smiles = await app_module.pubchem_client.get_canonical_smiles_by_name(value)
+            if smiles:
+                return smiles, f"Resolved using verified synonym: {raw}"
+        return await original_resolve_species(raw)
 
     def publication_split_compound_terms(text: str):
         return [
@@ -326,10 +325,10 @@ def install_publication_renderer(app_module) -> None:
             )
         await status_msg.delete()
 
-    # Patch Chemistry Drawing Bot symbols only.
     app_module.WELCOME_TEXT = PUBLICATION_WELCOME_TEXT
     app_module.find_reaction_separator = publication_find_reaction_separator
     app_module.detect_input_kind = publication_detect_input_kind
+    app_module.resolve_species = publication_resolve_species
     app_module.split_compound_terms = publication_split_compound_terms
     app_module.render_reaction_scheme = pub.render_reaction_scheme
     app_module._handle_reaction = publication_handle_reaction
