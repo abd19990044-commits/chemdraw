@@ -13,6 +13,7 @@ on:
       - 'advanced_chemistry*.py'
       - 'chemistry_ui.py'
       - 'rxn_export.py'
+      - 'cdxml_export.py'
       - 'tests/**'
       - '.github/workflows/publication-renderer-tests.yml'
   pull_request:
@@ -24,6 +25,7 @@ on:
       - 'advanced_chemistry*.py'
       - 'chemistry_ui.py'
       - 'rxn_export.py'
+      - 'cdxml_export.py'
       - 'tests/**'
       - '.github/workflows/publication-renderer-tests.yml'
 
@@ -55,7 +57,8 @@ jobs:
             app.py legacy_app.py \
             publication_renderer.py publication_renderer_v2.py publication_renderer_v3.py \
             publication_entry.py publication_entry_balanced.py publication_entry_advanced.py \
-            reaction_balancer.py advanced_chemistry.py advanced_chemistry_v2.py chemistry_ui.py rxn_export.py
+            reaction_balancer.py advanced_chemistry.py advanced_chemistry_v2.py \
+            chemistry_ui.py rxn_export.py cdxml_export.py
 
       - name: Run regression suite
         run: pytest -q tests
