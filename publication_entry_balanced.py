@@ -59,7 +59,8 @@ def install_publication_renderer(app_module) -> None:
         "• <b>CDXML file prepared to be opened and edited directly in ChemDraw</b>\n"
         "• RXN retained only as an optional compatibility format\n"
         "• Optional transparent publication background\n"
-        "• Element/charge balance verification\n\n"
+        "• Element/charge balance verification\n"
+        "• Bounded render queue for concurrent users on the free server\n\n"
         "Use the buttons below to configure your drawing preferences."
     )
 
@@ -172,12 +173,23 @@ def install_publication_renderer(app_module) -> None:
         if not capacity.try_reserve():
             snap = capacity.capacity_snapshot()
             await status_msg.edit_text(
-                "⏳ The free server is currently processing many chemistry jobs. "
-                "Please retry shortly. Your request was rejected before rendering to protect the service from running out of memory."
+                "⏳ The chemistry queue is full at the moment. Please retry shortly. "
+                "The request was stopped before rendering so the free server does not exceed its memory limit."
             )
             app_module.chem_logger.warning("Chemistry render queue full: %s", snap)
             return
 
+        queue_position = capacity.queued_position()
+        if queue_position > 0:
+            try:
+                await status_msg.edit_text(
+                    f"⏳ Your chemistry job is queued (approximately #{queue_position}). "
+                    "The free server processes heavy drawing jobs in a controlled order to protect CPU and memory."
+                )
+            except Exception:
+                pass
+
+        tiff_bytes = None
         try:
             left_key = _pairs_key(reactant_pairs)
             right_key = _pairs_key(product_pairs)
@@ -239,6 +251,9 @@ def install_publication_renderer(app_module) -> None:
                     "Reaction.rxn",
                     equation,
                 )
+
+            if settings.export_tiff and png_bytes:
+                tiff_bytes = await capacity.run_heavy(_tiff_from_png, png_bytes, 600)
         finally:
             capacity.release()
 
@@ -275,8 +290,7 @@ def install_publication_renderer(app_module) -> None:
                 document=app_module.bytes_to_named_bytesio(svg_bytes, "Reaction_vector.svg"),
                 caption="Publication vector SVG — recommended for manuscripts and graphical editing",
             )
-        if settings.export_tiff and png_bytes:
-            tiff_bytes = await capacity.run_heavy(_tiff_from_png, png_bytes, 600)
+        if settings.export_tiff and tiff_bytes:
             await update.message.reply_document(
                 document=app_module.bytes_to_named_bytesio(tiff_bytes, "Reaction_600dpi.tiff"),
                 caption="Publication TIFF — 600 DPI (LZW)",
@@ -311,7 +325,7 @@ def install_publication_renderer(app_module) -> None:
         application.add_handler(CallbackQueryHandler(settings_callback, pattern=r"^chem:"))
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, interactive_run_message))
         application.add_error_handler(app_module.error_handler)
-        app_module.chem_logger.info("Interactive Chemistry Bot controls enabled with bounded Render-free chemistry executor: %s", capacity.capacity_snapshot())
+        app_module.chem_logger.info("Interactive Chemistry Bot controls enabled with bounded Render-free chemistry queue: %s", capacity.capacity_snapshot())
         application.run_polling(
             allowed_updates=Update.ALL_TYPES,
             drop_pending_updates=True,
@@ -324,5 +338,5 @@ def install_publication_renderer(app_module) -> None:
     app_module.run_chem_bot = run_chem_bot_interactive
     app_module.render_reaction_scheme = pub.render_reaction_scheme
     app_module.chem_logger.info(
-        "Professional chemistry UI enabled: CDXML primary editable export, bounded CPU rendering, optional RXN/PNG/SVG/TIFF."
+        "Professional chemistry UI enabled: PNG/CDXML primary exports, bounded CPU queue, optional RXN/SVG/TIFF."
     )
