@@ -67,7 +67,7 @@ jobs:
             publication_entry.py publication_entry_balanced.py publication_entry_advanced.py \
             reaction_balancer.py advanced_chemistry.py advanced_chemistry_v2.py \
             chemistry_ui.py render_capacity.py rxn_export.py cdxml_export.py single_compound_pipeline.py \
-            geometry_normalizer.py psi4_extension.py psi4_extension_v2.py psi4_extension_v3.py
+            geometry_normalizer.py psi4_extension.py psi4_extension_v2.py psi4_extension_v3.py psi4_extension_v4.py
 
       - name: Run regression suite
         run: pytest -q tests
