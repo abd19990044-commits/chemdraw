@@ -11,14 +11,14 @@ Psithon (.dat) workflows while preserving the legacy implementation.
 import legacy_app as core
 from geometry_normalizer import install_geometry_normalizer
 from publication_entry_advanced import install_publication_renderer
-from psi4_extension_v3 import install_psi4_extension_v3
+from psi4_extension_v4 import install_psi4_extension_v4
 
 # Geometry normalization is installed before the quantum-input wizard so every
 # PubChem, MOL/SDF and XYZ path is canonicalized to Element/X/Y/Z coordinates
 # before either ORCA or Psi4 input text is written.
 install_geometry_normalizer(core)
 install_publication_renderer(core)
-install_psi4_extension_v3(core)
+install_psi4_extension_v4(core)
 
 # Re-export the Flask application for platforms/tools that import ``app:app``.
 app = core.app
