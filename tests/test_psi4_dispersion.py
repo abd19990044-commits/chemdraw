@@ -65,3 +65,26 @@ def test_precorrected_method_rejects_double_counting():
         assert "double counting" in str(exc)
     else:
         raise AssertionError("Double dispersion correction must be rejected")
+
+
+def test_production_install_does_not_create_recursive_generator():
+    """Reproduce the production installer chain that previously caused recursion."""
+    import importlib
+    import legacy_app as core
+    import psi4_extension as v1
+    import psi4_extension_v2 as v2
+    import psi4_extension_v3 as v3
+    import psi4_extension_v4 as v4
+
+    # Reload only the extension modules to restore their captured generator
+    # references, then install the exact production v4 stack onto legacy core.
+    v1 = importlib.reload(v1)
+    v2 = importlib.reload(v2)
+    v3 = importlib.reload(v3)
+    v4 = importlib.reload(v4)
+    v4.install_psi4_extension_v4(core)
+
+    text = core.generate_psi4_input(base_data(psi_dispersion="d3bj"))
+    assert "energy('b3lyp-d3bj2b')" in text
+    assert text.count("molecule mol {") == 1
+    assert "C 0.0000000000 0.0000000000 0.0000000000" in text
