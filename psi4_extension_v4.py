@@ -6,16 +6,21 @@ Dispersion is exposed only through Psi4 method aliases that are known to be
 supported by the driver. Functionals with built-in nonlocal dispersion (e.g.
 *-V) and composite methods are not offered an extra correction to avoid double
 counting. D4 aliases require the optional dftd4 Python module at runtime.
+
+Important implementation detail: this module never replaces v3's generator
+with itself. The previous implementation did that and created an infinite
+v4 -> v3(symbol now v4) -> v4 recursion. Instead v4 performs dispersion
+resolution and geometry normalization once, then calls v3's captured stable v2
+Psithon generator directly.
 """
 
 from typing import Any
 
 import psi4_extension as v1
 import psi4_extension_v3 as v3
+from geometry_normalizer import normalized_data_copy
 
 
-# Only advertise combinations for which Psi4 provides a documented method alias.
-# 'none' always leaves the selected functional unchanged.
 PSI4_DISPERSION_ALIASES: dict[str, dict[str, str]] = {
     "b3lyp": {
         "d3bj": "b3lyp-d3bj2b",
@@ -44,8 +49,6 @@ PSI4_DISPERSION_ALIASES: dict[str, dict[str, str]] = {
     },
 }
 
-# These already contain an explicit dispersion/nonlocal-correlation model or are
-# composite methods whose correction is part of the method definition.
 _BUILTIN_DISPERSION_MARKERS = (
     "-d3", "-d4", "-v", "b973c", "wb97x3c", "pbeh3c",
 )
@@ -86,18 +89,30 @@ def apply_dispersion_alias(method: str, correction: str) -> str:
 
 
 def generate_psi4_input_v4(data: dict[str, Any]) -> str:
+    """Resolve dispersion, normalize geometry, then build Psithon exactly once."""
     safe = dict(data)
     if safe.get("psi_family") == "dft":
         original = str(safe.get("psi_base_method") or safe.get("psi_method") or "b3lyp")
         correction = str(safe.get("psi_dispersion", "none"))
         safe["psi_method"] = apply_dispersion_alias(original, correction)
-    return v3.generate_psi4_input_v3(safe)
+
+    # Do not call v3.generate_psi4_input_v3 here: installers intentionally
+    # replace module-level generator symbols. Use v3's immutable captured base
+    # generator after applying the shared strict geometry normalizer once.
+    safe = normalized_data_copy(safe)
+    return v3._ORIGINAL_GENERATOR(safe)
 
 
 def install_psi4_extension_v4(core) -> None:
-    # Install all v3 geometry-safety and v2 scientific controls first.
-    v3.generate_psi4_input_v3 = generate_psi4_input_v4
+    # First install the complete v3/v2 wizard normally. This sets up all UI and
+    # geometry-safe handlers without altering v3's generator symbol.
     v3.install_psi4_extension_v3(core)
+
+    # v1's Telegram text handler resolves generate_psi4_input from its module
+    # globals at call time, so redirect that single final generation point to
+    # v4. This avoids recursive cross-module monkey-patching.
+    v1.generate_psi4_input = generate_psi4_input_v4
+    core.generate_psi4_input = generate_psi4_input_v4
 
     installed_callback = core.callback_handler
 
@@ -106,8 +121,6 @@ def install_psi4_extension_v4(core) -> None:
         data = query.data or ""
         ud = context.user_data
 
-        # Intercept DFT method selection before the older wizard jumps directly
-        # to basis-set selection. Non-DFT families retain their previous path.
         if data.startswith("psimeth_") and ud.get("psi_family") == "dft":
             await query.answer()
             method = data.split("_", 1)[1].strip().lower()
@@ -138,6 +151,8 @@ def install_psi4_extension_v4(core) -> None:
                 await query.edit_message_text(f"❌ {exc}")
                 return
             ud["psi_dispersion"] = correction
+            # Store the resolved alias for display; generate_psi4_input_v4 still
+            # resolves from psi_base_method so repeated processing is idempotent.
             ud["psi_method"] = resolved
             note = ""
             if correction == "d4":
@@ -151,5 +166,4 @@ def install_psi4_extension_v4(core) -> None:
         await installed_callback(update, context)
 
     core.callback_handler = callback_handler
-    core.generate_psi4_input = generate_psi4_input_v4
-    core.orca_logger.info("Psi4 v4 validated dispersion selector installed.")
+    core.orca_logger.info("Psi4 v4 validated dispersion selector installed (non-recursive generator).")
