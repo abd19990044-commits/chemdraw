@@ -29,7 +29,7 @@ base.PSI4_DFT_METHODS.update({
     "B97-3c": "b973c",
     "B3LYP-D3(BJ)": "b3lyp-d3bj2b",
     "PBE0-D3(BJ)": "pbe0-d3bj2b",
-    "CAM-B3LYP-D3(BJ)": "camb3lyp-d3bj2b",
+    "CAM-B3LYP-D3(BJ)": "cam-b3lyp-d3bj2b",
     "BP86-D3(BJ)": "bp86-d3bj2b",
     "BLYP-D3(BJ)": "blyp-d3bj2b",
     "B3LYP-D4": "b3lyp-d4",
