@@ -353,10 +353,21 @@ def test_orca_wizard_skips_invalid_correlation_settings():
     asyncio.run(run())
 
 
-def test_webhook_fails_closed_without_configured_secret(monkeypatch):
+def test_existing_webhook_stays_available_without_configured_secret(monkeypatch):
     import app
 
+    sent = []
+
+    class Bot:
+        async def send_message(self, chat_id, text, **kwargs):
+            sent.append((chat_id, text))
+            return {"message_id": 1}
+
+    monkeypatch.setattr(app.core, "_make_bot", lambda: Bot())
+    monkeypatch.setattr(app.core, "run_coro_in_background", asyncio.run)
     monkeypatch.setattr(app.core, "ORCA_WEBHOOK_SECRET", "")
     client = app.app.test_client()
-    assert client.post("/telegram", json={}).status_code == 503
+    payload = {"message": {"from": {"id": 42}, "chat": {"id": 42}, "message_id": 5, "text": "/start"}}
+    assert client.post("/telegram", json=payload).status_code == 200
+    assert sent and "Gaussian 16" in sent[0][1]
     assert client.get("/registerWebhook").status_code == 403

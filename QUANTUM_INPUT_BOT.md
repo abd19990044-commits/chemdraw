@@ -15,7 +15,7 @@ Psi4 PCM requires a Psi4 installation with PCMSolver support. Psi4 D4 method ali
 
 ## Deployment and checks
 
-The existing deployment uses `ORCA_BOT_TOKEN` for the quantum bot and `CHEM_BOT_TOKEN` for the independent drawing bot. **Set `ORCA_WEBHOOK_SECRET` before deployment** and register the quantum webhook using the existing `/registerWebhook` route. The quantum webhook refuses requests until the secret is configured. Keep the token and secret in environment variables; neither belongs in Git. Retain the existing `python app.py` startup for the combined two-bot process. No additional runtime dependency was introduced.
+The existing deployment uses `ORCA_BOT_TOKEN` for the quantum bot and `CHEM_BOT_TOKEN` for the independent drawing bot. Existing Telegram webhooks continue to receive messages if `ORCA_WEBHOOK_SECRET` has not yet been set. Set `ORCA_WEBHOOK_SECRET` to protect new registrations and the webhook; `/registerWebhook` and `/deleteWebhook` require it. After adding or changing the secret, register the webhook again so Telegram sends the matching secret header. Keep the token and secret in environment variables; neither belongs in Git. Retain the existing `python app.py` startup for the combined two-bot process. No additional runtime dependency was introduced.
 
 Run local verification with Python 3.12:
 

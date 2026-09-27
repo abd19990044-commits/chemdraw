@@ -214,21 +214,16 @@ def install_quantum_input_extension(core) -> None:
     core._clear_user_data = clear_user_data
     core._dispatch_update = dispatch
 
-    # The webhook and its management routes must not become public endpoints
-    # because a deployment omitted the shared secret.
-    original_webhook = core.app.view_functions["telegram_webhook_route"]
+    # Keep the existing Telegram webhook available during deployments that
+    # registered it before ORCA_WEBHOOK_SECRET was introduced. Requiring the
+    # secret here silently stops every message on those installations. The
+    # management routes still fail closed until a secret is configured.
     original_secret_check = core._check_secret
 
     def configured_secret_check(request):
         return bool(core.ORCA_WEBHOOK_SECRET) and original_secret_check(request)
 
-    def secured_webhook():
-        if not core.ORCA_WEBHOOK_SECRET:
-            return "ORCA_WEBHOOK_SECRET must be configured.", 503
-        return original_webhook()
-
     core._check_secret = configured_secret_check
-    core.app.view_functions["telegram_webhook_route"] = secured_webhook
 
     async def start_command(update, context):
         context.user_data.clear()
