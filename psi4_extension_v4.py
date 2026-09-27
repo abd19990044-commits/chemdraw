@@ -19,6 +19,7 @@ from typing import Any
 import psi4_extension as v1
 import psi4_extension_v3 as v3
 from geometry_normalizer import normalized_data_copy
+from quantum_validation import checked_molecule, bounded_int, one_line, safe_stem
 
 
 PSI4_DISPERSION_ALIASES: dict[str, dict[str, str]] = {
@@ -44,8 +45,8 @@ PSI4_DISPERSION_ALIASES: dict[str, dict[str, str]] = {
         "d3bj": "blyp-d3bj2b",
         "d3zero": "blyp-d3zero2b",
     },
-    "camb3lyp": {
-        "d3bj": "camb3lyp-d3bj2b",
+    "cam-b3lyp": {
+        "d3bj": "cam-b3lyp-d3bj2b",
     },
 }
 
@@ -100,6 +101,14 @@ def generate_psi4_input_v4(data: dict[str, Any]) -> str:
     # replace module-level generator symbols. Use v3's immutable captured base
     # generator after applying the shared strict geometry normalizer once.
     safe = normalized_data_copy(safe)
+    coords, charge, mult = checked_molecule(safe)
+    safe.update(coords=coords, charge=charge, mult=mult, name=safe_stem(safe.get("name")))
+    safe["psi_basis"] = one_line(safe.get("psi_basis", "def2-tzvp"), "Psi4 basis", r"[A-Za-z0-9+*().,_-]+")
+    safe["psi_method"] = one_line(safe.get("psi_method", "b3lyp"), "Psi4 method", r"[A-Za-z0-9+*().,_-]+")
+    safe["cores"] = bounded_int(safe.get("cores", 4), "CPU cores", 1, 256)
+    safe["psi_memory_mb"] = bounded_int(safe.get("psi_memory_mb", 4000), "Total memory (MB)", 256, 512000)
+    if safe.get("psi_solvation", "none") == "pcm" and safe.get("psi_solvent", "Water") not in v1.PSI4_SOLVENTS.values():
+        raise ValueError("Unsupported Psi4 PCM solvent. Use manual input for custom solvents.")
     return v3._ORIGINAL_GENERATOR(safe)
 
 

@@ -8,14 +8,16 @@ and other non-coordinate records are never forwarded to quantum-chemistry
 input files.
 """
 
+import math
 import re
 from typing import Any
 
 from rdkit import Chem
 
 
-_ELEMENT_RE = re.compile(r"^[A-Z][a-z]?$|^X$")
+_ELEMENT_RE = re.compile(r"^[A-Z][a-z]?$")
 _INT_RE = re.compile(r"^[+-]?\d+$")
+_ELEMENTS = {Chem.GetPeriodicTable().GetElementSymbol(i) for i in range(1, 119)}
 
 
 def _is_float(token: str) -> bool:
@@ -27,12 +29,14 @@ def _is_float(token: str) -> bool:
 
 
 def _format_xyz(symbol: str, x: Any, y: Any, z: Any) -> str:
-    if not _ELEMENT_RE.fullmatch(str(symbol)):
+    if not _ELEMENT_RE.fullmatch(str(symbol)) or symbol not in _ELEMENTS:
         raise ValueError(f"Invalid atomic symbol in coordinate data: {symbol!r}")
     try:
         xf, yf, zf = float(x), float(y), float(z)
     except (TypeError, ValueError) as exc:
         raise ValueError("Coordinate values must be numeric.") from exc
+    if not all(math.isfinite(v) for v in (xf, yf, zf)):
+        raise ValueError("Coordinates must be finite numbers.")
     return f"{symbol:<2s} {xf: .10f} {yf: .10f} {zf: .10f}"
 
 
@@ -79,38 +83,41 @@ def _try_mol_sdf(text: str) -> str | None:
 
 def _try_xyz(text: str) -> str | None:
     """Parse strict XYZ or already-normalized Element/X/Y/Z coordinate lines."""
-    lines = [ln.strip() for ln in text.replace("\r", "").split("\n") if ln.strip()]
-    if not lines:
+    raw_lines = text.replace("\r", "").strip("\n").split("\n")
+    if not raw_lines or not any(ln.strip() for ln in raw_lines):
         return None
 
     start = 0
     expected_atoms: int | None = None
-    if _INT_RE.fullmatch(lines[0]):
-        expected_atoms = int(lines[0])
-        if expected_atoms <= 0:
+    if _INT_RE.fullmatch(raw_lines[0].strip()):
+        expected_atoms = int(raw_lines[0].strip())
+        if not 1 <= expected_atoms <= 1000:
             return None
-        # Standard XYZ has an atom-count line and a comment line. Permit a
-        # missing/blank comment only when the following line is already an atom.
-        if len(lines) >= expected_atoms + 2:
-            start = 2
-        elif len(lines) >= expected_atoms + 1:
-            start = 1
-        else:
+        # The second XYZ line is a comment, which can be empty. Only permit a
+        # missing comment if the remaining lines are exactly atom records.
+        start = 2 if len(raw_lines) == expected_atoms + 2 else 1
+        if start == 2:
+            maybe_atom = raw_lines[1].split()
+            if len(maybe_atom) == 4 and maybe_atom[0] in _ELEMENTS and all(_is_float(v) for v in maybe_atom[1:]):
+                return None  # Extra coordinate masquerading as an XYZ comment.
+        if len(raw_lines) - start != expected_atoms:
             return None
+    lines = raw_lines[start:]
+    if len(lines) > 1000:
+        return None
 
     parsed: list[str] = []
-    source_lines = lines[start : start + expected_atoms] if expected_atoms is not None else lines
-    for line in source_lines:
+    for line in lines:
         parts = line.split()
-        if len(parts) < 4:
+        if len(parts) != 4:
             return None
         symbol, x, y, z = parts[0], parts[1], parts[2], parts[3]
         if not _ELEMENT_RE.fullmatch(symbol) or not all(_is_float(v) for v in (x, y, z)):
             return None
-        # Reject trailing MOL/connectivity-style numerical columns in a bare
-        # coordinate block. Normal XYZ may have optional text, but the bot only
-        # emits the first four fields after strict element-first validation.
-        parsed.append(_format_xyz(symbol, x, y, z))
+        try:
+            parsed.append(_format_xyz(symbol, x, y, z))
+        except ValueError:
+            return None
 
     if expected_atoms is not None and len(parsed) != expected_atoms:
         return None

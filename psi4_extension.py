@@ -32,7 +32,7 @@ PSI4_FAMILIES = {
 PSI4_DFT_METHODS = {
     "B3LYP": "b3lyp",
     "PBE0": "pbe0",
-    "CAM-B3LYP": "camb3lyp",
+    "CAM-B3LYP": "cam-b3lyp",
     "ωB97X": "wb97x",
     "ωB97X-D": "wb97x-d",
     "ωB97M-V": "wb97m-v",

@@ -87,4 +87,6 @@ def test_production_install_does_not_create_recursive_generator():
     text = core.generate_psi4_input(base_data(psi_dispersion="d3bj"))
     assert "energy('b3lyp-d3bj2b')" in text
     assert text.count("molecule mol {") == 1
-    assert "C 0.0000000000 0.0000000000 0.0000000000" in text
+    assert [line.split() for line in text.splitlines() if line.strip().startswith("C ")][0] == [
+        "C", "0.0000000000", "0.0000000000", "0.0000000000"
+    ]
