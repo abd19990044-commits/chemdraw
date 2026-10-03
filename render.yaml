@@ -1,0 +1,19 @@
+# Render Blueprint for the two merged Telegram bots (ORCA + Chemistry).
+# Secrets are never stored here: Render asks for them when the Blueprint is created.
+services:
+  - type: web
+    name: chemdraw-bots
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python app.py
+    healthCheckPath: /health
+    envVars:
+      - key: ORCA_BOT_TOKEN
+        sync: false
+      - key: CHEM_BOT_TOKEN
+        sync: false
+      # Telegram only accepts A-Z a-z 0-9 _ - in this value, so Render's
+      # generateValue (base64) is not suitable. Use secrets.token_urlsafe(32).
+      - key: ORCA_WEBHOOK_SECRET
+        sync: false
