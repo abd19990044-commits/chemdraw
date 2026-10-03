@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from fractions import Fraction
 from xml.etree import ElementTree as ET
 
@@ -18,6 +19,9 @@ BASELINE_Y = 110.0
 LABEL_SIZE = 10.0
 CAPTION_SIZE = 10.0
 TEXT_SIZE = 10.0
+FONT_ID = 3
+# Object ids must be unique across the whole file, including the font id above.
+FIRST_OBJECT_ID = 10
 
 _SUBSCRIPT = str.maketrans("0123456789", "₀₁₂₃₄₅₆₇₈₉")
 
@@ -77,13 +81,34 @@ def _bond_order_value(bond: Chem.Bond) -> str:
     return "1"
 
 
+_SUPER_RE = re.compile(r"\^([+\-]?\d*[+\-]?)")
+
+
+def _text_runs(text: str) -> list[tuple[str, bool]]:
+    """Split ``H^+`` into [("H", False), ("+", True)]; plain text stays one run."""
+    runs: list[tuple[str, bool]] = []
+    pos = 0
+    for m in _SUPER_RE.finditer(text):
+        if not m.group(1):
+            continue
+        if m.start() > pos:
+            runs.append((text[pos:m.start()], False))
+        runs.append((m.group(1), True))
+        pos = m.end()
+    if pos < len(text):
+        runs.append((text[pos:], False))
+    return runs or [(text, False)]
+
+
 def _add_text(page: ET.Element, obj_id: int, x: float, y: float, text: str, size: float = TEXT_SIZE, bold: bool = False) -> int:
     t = ET.SubElement(page, "t", {"id": str(obj_id), "p": f"{x:.2f} {y:.2f}", "Justification": "Center"})
-    s_attrs = {"font": "3", "size": f"{float(size):g}"}
-    if bold:
-        s_attrs["face"] = "1"
-    s = ET.SubElement(t, "s", s_attrs)
-    s.text = text
+    for chunk, sup in _text_runs(text):
+        s_attrs = {"font": str(FONT_ID), "size": f"{float(size):g}"}
+        face = (1 if bold else 0) | (32 if sup else 0)
+        if face:
+            s_attrs["face"] = str(face)
+        s = ET.SubElement(t, "s", s_attrs)
+        s.text = chunk
     return obj_id + 1
 
 
@@ -123,10 +148,6 @@ def _add_fragment(page: ET.Element, obj_id: int, mol: Chem.Mol, x0: float, cente
             attrs["Display"] = "WedgeBegin"
         elif direction == Chem.BondDir.BEGINDASH:
             attrs["Display"] = "WedgedHashBegin"
-        elif direction == Chem.BondDir.ENDUPRIGHT:
-            attrs["Display"] = "WedgeEnd"
-        elif direction == Chem.BondDir.ENDDOWNRIGHT:
-            attrs["Display"] = "WedgedHashEnd"
         ET.SubElement(frag, "b", attrs)
         obj_id += 1
     return obj_id, width
@@ -136,17 +157,34 @@ def _new_cdxml_root(width: float, height: float) -> tuple[ET.Element, ET.Element
     root = ET.Element("CDXML", {
         "BoundingBox": f"0 0 {width:.0f} {height:.0f}",
         "BondLength": f"{BOND_LENGTH:g}",
-        "LabelFont": "3", "LabelSize": f"{LABEL_SIZE:g}",
-        "CaptionFont": "3", "CaptionSize": f"{CAPTION_SIZE:g}",
+        "LabelFont": str(FONT_ID), "LabelSize": f"{LABEL_SIZE:g}",
+        "CaptionFont": str(FONT_ID), "CaptionSize": f"{CAPTION_SIZE:g}",
         "LineWidth": "0.6", "BoldWidth": "2", "HashSpacing": "2.5", "MarginWidth": "1.6",
     })
     colors = ET.SubElement(root, "colortable")
     ET.SubElement(colors, "color", {"r": "1", "g": "1", "b": "1"})
     ET.SubElement(colors, "color", {"r": "0", "g": "0", "b": "0"})
     fonts = ET.SubElement(root, "fonttable")
-    ET.SubElement(fonts, "font", {"id": "3", "charset": "unicode", "name": "Arial"})
+    ET.SubElement(fonts, "font", {"id": str(FONT_ID), "charset": "iso-8859-1", "name": "Arial"})
     page = ET.SubElement(root, "page", {"id": "1", "BoundingBox": f"0 0 {width:.0f} {height:.0f}", "Width": f"{width:.0f}", "Height": f"{height:.0f}"})
     return root, page
+
+
+_XML_HEADER = (
+    b'<?xml version="1.0" encoding="UTF-8" ?>\n'
+    b'<!DOCTYPE CDXML SYSTEM "http://www.cambridgesoft.com/xml/cdxml.dtd" >\n'
+)
+
+
+def _serialize(root: ET.Element) -> bytes:
+    """Add ChemDraw-style Z-order and the CDXML DOCTYPE, then serialize."""
+    z = 1
+    page = root.find("page")
+    for el in page.iter():
+        if el.tag in ("fragment", "n", "b", "t", "graphic"):
+            el.set("Z", str(z))
+            z += 1
+    return _XML_HEADER + ET.tostring(root, encoding="utf-8")
 
 
 def generate_single_compound_cdxml(smiles: str, title: str = "Compound") -> bytes | None:
@@ -160,8 +198,8 @@ def generate_single_compound_cdxml(smiles: str, title: str = "Compound") -> byte
     height = max(180.0, mol_h + 2 * PAGE_MARGIN)
     root, page = _new_cdxml_root(width, height)
     x0 = (width - mol_w) / 2.0
-    _add_fragment(page, 2, mol, x0, height / 2.0)
-    return ET.tostring(root, encoding="utf-8", xml_declaration=True)
+    _add_fragment(page, FIRST_OBJECT_ID, mol, x0, height / 2.0)
+    return _serialize(root)
 
 
 def _text_width(text: str) -> float:
@@ -219,7 +257,7 @@ def generate_reaction_cdxml(reactant_pairs, product_pairs, *, arrow_top: str = "
     if not reactants or not products:
         return None
     root, page = _new_cdxml_root(800, 260)
-    obj_id = 2
+    obj_id = FIRST_OBJECT_ID
     def add_side(items, x_start: float) -> float:
         nonlocal obj_id
         xcur = x_start
@@ -258,4 +296,4 @@ def generate_reaction_cdxml(reactant_pairs, product_pairs, *, arrow_top: str = "
     page.set("Width", f"{page_width:.0f}")
     page.set("Height", "220")
     root.set("BoundingBox", page.get("BoundingBox", "0 0 800 260"))
-    return ET.tostring(root, encoding="utf-8", xml_declaration=True)
+    return _serialize(root)
