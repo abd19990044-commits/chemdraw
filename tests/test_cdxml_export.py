@@ -64,12 +64,12 @@ def test_cdxml_smart_mode_matches_condensed_small_species():
     assert data is not None
     root = ET.fromstring(data)
     text = " ".join("".join(t.itertext()) for t in root.findall("page/t"))
-    assert "CH₂" in text
-    assert "H₂" in text
-    assert "CH₃" in text
-    assert len(root.findall("page/fragment")) == 0
-    plain_lines = [g for g in root.findall("page/graphic") if not g.get("ArrowType")]
-    assert len(plain_lines) >= 3
+    # Smart image previews may be condensed; downloadable CDXML must remain
+    # a true editable molecule graph (not just text plus graphic lines).
+    fragments = root.findall("page/fragment")
+    assert len(fragments) == 3
+    assert sum(len(f.findall("n")) for f in fragments) >= 6
+    assert not [g for g in root.findall("page/graphic") if g.get("GraphicType") == "Line" and not g.get("ArrowType")]
 
 
 def test_cdxml_equilibrium_arrow():
@@ -128,3 +128,24 @@ def test_cdxml_uses_normal_chemdraw_font_scale():
     assert sizes
     assert max(sizes) <= 14
     assert min(sizes) >= 8
+
+
+def test_cdxml_superscript_font_face_is_64():
+    from cdxml_export import _add_text
+    page = ET.Element("page")
+    _add_text(page, 10, 10, 10, "H^+")
+    runs = page.findall("t/s")
+    assert [r.text for r in runs] == ["H", "+"]
+    assert runs[1].get("face") == "64"
+
+
+def test_cdxml_chiral_round_trip_preserves_configuration():
+    from rdkit import Chem
+    if not Chem.HasChemDrawCDXSupport():
+        import pytest
+        pytest.skip("RDKit CDXML parser unavailable")
+    for smiles in ("C[C@H](O)C(=O)O", "C[C@@H](O)C(=O)O"):
+        data = generate_single_compound_cdxml(smiles)
+        parsed = Chem.MolsFromCDXML(data.decode("utf-8"))
+        assert len(parsed) == 1
+        assert Chem.MolToSmiles(parsed[0], isomericSmiles=True) == Chem.MolToSmiles(Chem.MolFromSmiles(smiles), isomericSmiles=True)

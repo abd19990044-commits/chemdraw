@@ -104,7 +104,7 @@ def _add_text(page: ET.Element, obj_id: int, x: float, y: float, text: str, size
     t = ET.SubElement(page, "t", {"id": str(obj_id), "p": f"{x:.2f} {y:.2f}", "Justification": "Center"})
     for chunk, sup in _text_runs(text):
         s_attrs = {"font": str(FONT_ID), "size": f"{float(size):g}"}
-        face = (1 if bold else 0) | (32 if sup else 0)
+        face = (1 if bold else 0) | (64 if sup else 0)
         if face:
             s_attrs["face"] = str(face)
         s = ET.SubElement(t, "s", s_attrs)
@@ -135,9 +135,7 @@ def _add_fragment(page: ET.Element, obj_id: int, mol: Chem.Mol, x0: float, cente
         isotope = atom.GetIsotope()
         if isotope:
             attrs["Isotope"] = str(isotope)
-        amap = atom.GetAtomMapNum()
-        if amap:
-            attrs["AtomMap"] = str(amap)
+        # Atom mapping is not represented by a node AtomMap attribute.
         ET.SubElement(frag, "n", attrs)
         atom_ids[i] = obj_id
         obj_id += 1
@@ -231,12 +229,13 @@ def _add_formula_or_condensed(page: ET.Element, obj_id: int, x0: float, center_y
 
 
 def _display_label(smiles: str, small_as_formula: bool) -> str | None:
-    if not small_as_formula:
-        return None
-    condensed = pub2._condensed_for_display(smiles)
-    if condensed:
-        return condensed
-    return pub2.base.formula_for_display(smiles)
+    """Always export an actual molecular graph, not an uneditable text formula.
+
+    Display simplification belongs in the PNG/SVG renderer. For ChemDraw, even
+    H2O and condensed carbon groups should retain atom and bond objects.
+    This intentionally overrides smart/condensed preview styles for CDXML.
+    """
+    return None
 
 
 def generate_reaction_cdxml(reactant_pairs, product_pairs, *, arrow_top: str = "", arrow_bottom: str = "", arrow_style: str = "forward", title: str = "Reaction", small_as_formula: bool = True) -> bytes | None:
