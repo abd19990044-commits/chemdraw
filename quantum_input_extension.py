@@ -9,6 +9,7 @@ import re
 import weakref
 
 import gaussian_input as g16
+from gaussview_linux import convert_gaussview_to_linux, decode_gaussview_text
 import psi4_extension as psi4_ui
 from geometry_normalizer import normalize_geometry_xyz
 from quantum_validation import (
@@ -232,6 +233,9 @@ def install_quantum_input_extension(core) -> None:
     async def _manual_result(message, ud, text, engine, source_name=None):
         try:
             content = manual_input(text, engine)
+            report = convert_gaussview_to_linux(content) if engine == "gaussian" else None
+            if report:
+                content = manual_input(report.content, engine)
         except ValueError as exc:
             await message.reply_text(
                 f"❌ {exc} Correct the input and try again, or /cancel."
@@ -243,8 +247,16 @@ def install_quantum_input_extension(core) -> None:
             message,
             content,
             f"{stem}.{suffix}",
-            f"✅ {engine.title()} manual input saved. Check the calculation before running it on Linux.",
+            f"✅ {engine.title()} input prepared for Linux. Calculation settings preserved.",
         )
+        if report and (report.converted_directives or report.warnings):
+            details = []
+            if report.converted_directives:
+                details.append("Adapted file paths: " + ", ".join(report.converted_directives))
+            if report.required_files:
+                details.append("Required external files: " + ", ".join(report.required_files))
+            details.extend(report.warnings)
+            await message.reply_text("⚠️ Linux input notes:\n" + "\n".join(details)[:3000])
         ud.clear()
 
     async def handle_name(update, context):
@@ -317,7 +329,7 @@ def install_quantum_input_extension(core) -> None:
                 raw = await remote.download_as_bytes()
                 if len(raw) > MAX_MANUAL_BYTES:
                     raise ValueError("Manual input is larger than 128 kB.")
-                decoded = raw.decode("utf-8-sig")
+                decoded = decode_gaussview_text(raw) if manual_engine == "gaussian" else raw.decode("utf-8-sig")
             except (UnicodeDecodeError, ValueError) as exc:
                 await update.message.reply_text(f"❌ Cannot read text input: {exc}")
                 return
