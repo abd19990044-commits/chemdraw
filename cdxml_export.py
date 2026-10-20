@@ -231,12 +231,13 @@ def _add_formula_or_condensed(page: ET.Element, obj_id: int, x0: float, center_y
 
 
 def _display_label(smiles: str, small_as_formula: bool) -> str | None:
-    if not small_as_formula:
-        return None
-    condensed = pub2._condensed_for_display(smiles)
-    if condensed:
-        return condensed
-    return pub2.base.formula_for_display(smiles)
+    """Always export an actual molecular graph, not an uneditable text formula.
+
+    Display simplification belongs in the PNG/SVG renderer. For ChemDraw, even
+    H2O and condensed carbon groups should retain atom and bond objects.
+    This intentionally overrides smart/condensed preview styles for CDXML.
+    """
+    return None
 
 
 def generate_reaction_cdxml(reactant_pairs, product_pairs, *, arrow_top: str = "", arrow_bottom: str = "", arrow_style: str = "forward", title: str = "Reaction", small_as_formula: bool = True) -> bytes | None:
