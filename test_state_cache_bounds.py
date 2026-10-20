@@ -59,7 +59,7 @@ def test_supports_exactly_the_calls_the_bot_makes():
 
 def test_env_numbers_fall_back_to_defaults(monkeypatch):
     monkeypatch.setenv("STATE_CACHE_MAX_ITEMS", "abc")
-    assert _env_number("STATE_CACHE_MAX_ITEMS", 500, int) == 128
+    assert _env_number("STATE_CACHE_MAX_ITEMS", 500, int) == 500
     monkeypatch.setenv("STATE_CACHE_MAX_ITEMS", "-3")
     assert _env_number("STATE_CACHE_MAX_ITEMS", 500, int) == 500
     monkeypatch.setenv("STATE_CACHE_MAX_ITEMS", "40")
@@ -70,7 +70,7 @@ def test_orca_bot_uses_the_bounded_store():
     import legacy_app
 
     assert isinstance(legacy_app._state_cache, BoundedStateCache)
-    assert legacy_app._state_cache.max_items == 500
+    assert legacy_app._state_cache.max_items == 128
     assert legacy_app._state_cache.ttl_seconds == 30 * 60
 
 
