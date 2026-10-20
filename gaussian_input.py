@@ -6,6 +6,9 @@ available through the separate manual-input path, without rewriting user text.
 
 from __future__ import annotations
 
+import gaussian_catalog as catalog
+import gaussian_advanced as advanced
+
 from quantum_validation import (
     MAX_GAUSSIAN_DISK_MB,
     bounded_int,
@@ -22,26 +25,12 @@ TASKS = {
     "Transition state + frequencies": "ts",
     "TD-DFT / UV-Vis": "td",
     "NMR shielding (GIAO)": "nmr",
+    "Gradient / atomic forces": "force",
+    "Static polarizability": "polar",
 }
-METHODS = {
-    "B3LYP": "B3LYP",
-    "PBE0 (Gaussian PBE1PBE)": "PBE1PBE",
-    "CAM-B3LYP": "CAM-B3LYP",
-    "M06-2X": "M062X",
-    "ωB97X-D (built-in dispersion)": "wB97XD",
-    "Hartree-Fock": "HF",
-    "MP2": "MP2",
-    "CCSD(T) — single point only": "CCSD(T)",
-}
-BASIS = {
-    "6-31G(d)": "6-31G(d)",
-    "6-31+G(d,p)": "6-31+G(d,p)",
-    "6-311++G(d,p)": "6-311++G(d,p)",
-    "def2-SVP": "Def2SVP",
-    "def2-TZVP": "Def2TZVP",
-    "cc-pVDZ": "cc-pVDZ",
-    "aug-cc-pVDZ": "aug-cc-pVDZ",
-}
+METHODS = catalog.METHODS
+BASIS = catalog.BASIS
+
 DISPERSION = {"None / functional default": "none", "D3(BJ)": "GD3BJ"}
 SOLVATION = {"Gas phase": "none", "IEFPCM": "IEFPCM", "SMD": "SMD"}
 SOLVENTS = {
@@ -60,16 +49,18 @@ ACCURACY = {"Standard": "standard", "Tight SCF + UltraFine grid": "tight"}
 
 
 def allowed_tasks(method: str) -> dict[str, str]:
-    if method == "CCSD(T)":
+    # Advanced post-HF and double hybrids are conservatively single-point only
+    # in the guided workflow. More demanding derivative jobs use /manual.
+    restricted = {
+        "CCSD(T)", "CCSD", "MP3", "QCISD", "QCISD(T)",
+        "B2PLYP", "mPW2PLYP", "PBE0DH", "PBEQIDH",
+    }
+    if method in restricted:
         return {"Single point energy": "sp"}
     if method == "MP2":
-        return {
-            label: task
-            for label, task in TASKS.items()
-            if task in {"sp", "opt", "freq", "optfreq"}
-        }
+        return {k: v for k, v in TASKS.items() if v in {"sp", "opt", "freq", "optfreq", "force"}}
     if method == "HF":
-        return {label: task for label, task in TASKS.items() if task != "td"}
+        return {k: v for k, v in TASKS.items() if v != "td"}
     return TASKS
 
 
@@ -82,10 +73,18 @@ def generate_gaussian_16_input(data: dict) -> str:
     solvation = str(data.get("gauss_solvation", "none"))
     solvent = str(data.get("gauss_solvent", "Water"))
     accuracy = str(data.get("gauss_accuracy", "standard"))
-    if method not in METHODS.values() or basis not in BASIS.values():
-        raise ValueError(
-            "Choose a supported Gaussian method and basis, or use manual input."
-        )
+    custom_method = data.get("gauss_custom_method") == method
+    custom_basis = data.get("gauss_custom_basis") == basis
+    if method not in METHODS.values() and not custom_method:
+        raise ValueError("Choose a supported Gaussian method or enter a custom method keyword.")
+    if basis not in BASIS.values() and not custom_basis:
+        raise ValueError("Choose a supported basis or enter a custom basis keyword.")
+    if custom_method:
+        catalog.custom_keyword(method, "method")
+        if task != "sp":
+            raise ValueError("Custom Gaussian methods are single-point only in the guided mode; use /manual for derivatives.")
+    if custom_basis:
+        catalog.custom_keyword(basis, "basis")
     if task not in allowed_tasks(method).values():
         raise ValueError(
             f"Gaussian {task} is not offered for {method}; use manual input for expert jobs."
@@ -98,7 +97,7 @@ def generate_gaussian_16_input(data: dict) -> str:
         )
     if solvation not in SOLVATION.values() or solvent not in SOLVENTS.values():
         raise ValueError("Choose a supported Gaussian solvent model and solvent.")
-    if method in {"MP2", "CCSD(T)"} and solvation != "none":
+    if method in {"MP2", "MP3", "CCSD", "CCSD(T)", "QCISD", "QCISD(T)"} and solvation != "none":
         raise ValueError(
             "The guided post-HF presets use gas phase; specify expert solvent jobs manually."
         )
@@ -129,6 +128,8 @@ def generate_gaussian_16_input(data: dict) -> str:
                 f"TD=(NStates={bounded_int(data.get('nroots', 10), 'Excited states', 1, 200)})"
             ],
             "nmr": ["NMR=GIAO"],
+            "force": ["Force"],
+            "polar": ["Polar"],
         }[task]
     )
     if dispersion != "none":
@@ -137,8 +138,35 @@ def generate_gaussian_16_input(data: dict) -> str:
         route.append(f"SCRF=({solvation},Solvent={solvent})")
     if accuracy == "tight":
         route.append("SCF=(Tight,XQC)")
-        if method not in {"HF", "MP2", "CCSD(T)"}:
+        if method not in advanced.POST_HF and method != "HF":
             route.append("Integral=UltraFine")
+    if any("gauss_" + fld in data for fld in advanced.FIELD_OPTIONS):
+        for opt in advanced.validate_and_route(data):
+            if opt.startswith("@opt:"):
+                keyword = opt.split(":", 1)[1]
+                route = [item for item in route if item != "Opt" and not item.startswith("Opt=")]
+                route.insert(1, keyword)
+            elif opt.startswith("@freq:"):
+                keyword = opt.split(":", 1)[1]
+                route = [item for item in route if item != "Freq" and not item.startswith("Freq=")]
+                route.insert(2 if task in {"optfreq", "ts"} else 1, keyword)
+            elif opt.startswith("@nmr:"):
+                keyword = opt.split(":", 1)[1]
+                route = [item for item in route if not item.startswith("NMR=")]
+                route.insert(1, keyword)
+            elif opt.startswith("@tdroot:"):
+                nstates = bounded_int(data.get("nroots", 10), "Excited states", 1, 200)
+                root = bounded_int(opt.split(":", 1)[1], "TD root", 1, nstates)
+                route = [
+                    f"TD=(NStates={nstates},Root={root})" if item.startswith("TD=(") else item
+                    for item in route
+                ]
+            elif opt.startswith(("SCF=", "Integral=")):
+                key = opt.split("=", 1)[0] + "="
+                route = [item for item in route if not item.startswith(key)]
+                route.append(opt)
+            else:
+                route.append(opt)
     route.append(f"MaxDisk={disk}MB")
     return (
         f"%NProcShared={cores}\n%Mem={memory}MB\n%Chk={stem}.chk\n"
