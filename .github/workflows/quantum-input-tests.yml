@@ -11,6 +11,8 @@ on:
       - "legacy_app.py"
       - "bounded_state_cache.py"
       - "test_state_cache_bounds.py"
+      - "tests/**"
+      - "requirements.txt"
       - "gaussview_linux.py"
       - "tests/test_gaussview_linux.py"
       - "psi4_extension*.py"
