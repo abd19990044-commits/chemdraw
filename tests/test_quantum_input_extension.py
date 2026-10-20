@@ -212,6 +212,7 @@ def test_gaussian_wizard_from_geometry_to_download():
             "g_solv_SMD",
             "g_solvent_Water",
             "g_accuracy_tight",
+            "gadv_gate_defaults",
         ):
             q = Query(button)
             await core.callback_handler(SimpleNamespace(callback_query=q), ctx)
