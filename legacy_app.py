@@ -57,6 +57,7 @@ import threading
 from fractions import Fraction
 import urllib.parse
 from collections import OrderedDict
+from bounded_state_cache import BoundedStateCache
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import Enum, auto
@@ -162,7 +163,7 @@ def _cache_set(key: str, value: tuple):
 # أو أُعيد نشرها، تُفقد كل الجلسات المفتوحة. هذا مقبول لخطة مجانية؛ إن احتجت
 # دوام الحالة عبر عمليات إعادة التشغيل مستقبلاً، أضف قاعدة بيانات خارجية
 # بسيطة (مثل Redis المجاني على Upstash) بدل هذا الـ dict.
-_state_cache: dict[str, dict[str, Any]] = {}
+_state_cache: BoundedStateCache = BoundedStateCache()
 
 
 async def _load_user_data(chat_id: int) -> dict[str, Any]:
