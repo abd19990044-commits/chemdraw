@@ -243,7 +243,16 @@ def run_coro_in_background(coro):
     global _background_loop
     if _background_loop is None:
         _background_loop = _start_background_loop()
-    return asyncio.run_coroutine_threadsafe(coro, _background_loop)
+    future = asyncio.run_coroutine_threadsafe(coro, _background_loop)
+
+    def log_failed_future(done):
+        try:
+            done.result()
+        except Exception:
+            orca_logger.exception('Background Telegram coroutine failed')
+
+    future.add_done_callback(log_failed_future)
+    return future
 
 
 # ─────────────────────────────────────────────
@@ -590,7 +599,7 @@ async def get_wikipedia_summary_async(compound_name: str) -> str:
                 extract = data.get('extract', '')
                 if extract:
                     match = re.search(r'^(.*?)\.', extract)
-                    return f"📖 <b>Wikipedia:</b> {match.group(1)}." if match else f"📖 <b>Wikipedia:</b> {extract}"
+                    return f"📖 <b>Wikipedia:</b> {html.escape(match.group(1), quote=False)}." if match else f"📖 <b>Wikipedia:</b> {html.escape(extract, quote=False)}"
     except Exception as e:
         orca_logger.error(f'Wikipedia Error: {e}')
     return ''
@@ -623,7 +632,7 @@ async def get_solubility_async(cid: int) -> str:
             sol_texts: list[str] = []
             _extract_solubility_recursive(resp.json(), sol_texts)
             if sol_texts:
-                return '\n'.join([f'  🔹 {s}' for s in sol_texts[:3]])
+                return '\n'.join([f'  🔹 {html.escape(s, quote=False)}' for s in sol_texts[:3]])
     except Exception as e:
         orca_logger.error(f'Solubility Error: {e}')
     return '  🔹 (Not available)'
@@ -817,9 +826,9 @@ async def fetch_compound_async(name: str) -> tuple:
         )
 
         props_text = (
-            f'🧪 <b>Compound:</b> {iupac_name or name}\n'
-            f'📝 <b>Formula:</b> {mol_formula}\n'
-            f'⚖️ <b>Weight:</b> {mol_weight} g/mol\n\n'
+            f'🧪 <b>Compound:</b> {html.escape(str(iupac_name or name), quote=False)}\n'
+            f'📝 <b>Formula:</b> {html.escape(str(mol_formula or ""), quote=False)}\n'
+            f'⚖️ <b>Weight:</b> {html.escape(str(mol_weight or ""), quote=False)} g/mol\n\n'
             f'💧 <b>Solubility:</b>\n{sol_text}\n\n'
             f'{wiki_text}'
         )
@@ -1270,7 +1279,7 @@ async def _dispatch_update(bot: TelegramAPI, raw_update: dict[str, Any]):
         elif update.message and update.message.text:
             await handle_text_input(update, context)
     except Exception as e:
-        orca_logger.error(f'خطأ غير متوقع أثناء معالجة التحديث: {e}')
+        orca_logger.exception('Unexpected error while handling Telegram update')
     finally:
         try:
             await _save_user_data(chat_id, context.user_data)
