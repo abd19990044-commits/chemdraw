@@ -1654,7 +1654,9 @@ def safe_filename(name: str) -> str:
 # ============================================================================
 class _LRUCache:
     def __init__(self, max_entries: int) -> None:
-        self._max_entries = max_entries\n        self._timestamps = {}\n        self._ttl = 30 * 60
+        self._max_entries = max_entries
+        self._timestamps = {}
+        self._ttl = 30 * 60
         self._data: "OrderedDict[str, Optional[str]]" = OrderedDict()
 
     def get(self, key: str) -> Optional[str]:
@@ -1664,7 +1666,8 @@ class _LRUCache:
             self._data.pop(key, None)
             self._timestamps.pop(key, None)
             return None
-        self._data.move_to_end(key)\n        self._timestamps[key] = time.monotonic()
+        self._data.move_to_end(key)
+        self._timestamps[key] = time.monotonic()
         return self._data[key]
 
     def sweep(self) -> int:
@@ -1676,9 +1679,12 @@ class _LRUCache:
         return len(expired)
 
     def set(self, key: str, value: Optional[str]) -> None:
-        self._data[key] = value\n        self._timestamps[key] = time.monotonic()\n        self._data.move_to_end(key)
+        self._data[key] = value
+        self._timestamps[key] = time.monotonic()
+        self._data.move_to_end(key)
         if len(self._data) > self._max_entries:
-            k, _ = self._data.popitem(last=False)\n            self._timestamps.pop(k, None)
+            k, _ = self._data.popitem(last=False)
+            self._timestamps.pop(k, None)
 
 
 class PubChemClient:
