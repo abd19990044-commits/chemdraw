@@ -405,7 +405,7 @@ def test_compound_lookup_preview_failure_still_shows_engine_menu(monkeypatch):
         await core.handle_name(SimpleNamespace(message=BrokenPreviewMessage()), ctx)
 
     asyncio.run(run())
-    assert ctx.user_data["coords"] == water
+    assert ctx.user_data["coords"] == normalize_geometry_xyz(water)
     assert ctx.user_data["state"] == "waiting_for_engine"
     last = events[-1]
     assert last[0] == "text"
