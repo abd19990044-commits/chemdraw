@@ -54,6 +54,7 @@ import logging
 import os
 import re
 import threading
+import time
 from fractions import Fraction
 import urllib.parse
 from collections import OrderedDict
@@ -126,24 +127,26 @@ RENDER_EXTERNAL_URL = os.environ.get('RENDER_EXTERNAL_URL', '')
 # كاش بسيط في الذاكرة لبيانات المركّبات (TTL = 6 ساعات)
 # ─────────────────────────────────────────────
 _compound_cache: dict[str, tuple[datetime, tuple]] = {}
-CACHE_TTL = timedelta(hours=6)
+CACHE_TTL = timedelta(minutes=30)
 # إصلاح (L4): حد أقصى لعدد العناصر المخزّنة لأن كل عنصر قد يحوي bytes صورة PNG،
 # وبدون حد أقصى يمكن أن تتضخم الذاكرة على خطة Render المجانية (512MB RAM) حتى
 # يُعاد تشغيل الخدمة (OOM). عند تجاوز الحد نحذف أقدم عنصر.
-CACHE_MAX_ITEMS = 50
+CACHE_MAX_ITEMS = 8
 
 
 def _cache_get(key: str):
     if key in _compound_cache:
         ts, value = _compound_cache[key]
         if datetime.now() - ts < CACHE_TTL:
-            orca_logger.info(f'Cache HIT: {key}')
+            _compound_cache[key] = (datetime.now(), value)
             return value
         del _compound_cache[key]
     return None
 
 
 def _cache_set(key: str, value: tuple):
+    if CACHE_MAX_ITEMS <= 0:
+        return
     if len(_compound_cache) >= CACHE_MAX_ITEMS:
         oldest_key = min(_compound_cache, key=lambda k: _compound_cache[k][0])
         del _compound_cache[oldest_key]
@@ -192,7 +195,7 @@ async def get_http_client() -> httpx.AsyncClient:
     if _http_client is None or _http_client.is_closed:
         _http_client = httpx.AsyncClient(
             timeout=httpx.Timeout(12.0, connect=6.0),
-            limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+            limits=httpx.Limits(max_connections=8, max_keepalive_connections=4),
             # إصلاح: كان الـ User-Agent السابق "Mozilla/5.0 ORCABot/3.0" يحوي
             # كلمة "Bot" صراحةً، وهي علامة يعتمد عليها كثير من أنظمة الحماية
             # ضد الزحف الآلي (WAF/anti-bot) لحظر أو تقييد الطلبات تلقائياً —
@@ -233,6 +236,28 @@ def _start_background_loop() -> asyncio.AbstractEventLoop:
 
     t = threading.Thread(target=_runner, name='bot-event-loop', daemon=True)
     t.start()
+
+    async def _periodic_cleanup():
+        while True:
+            await asyncio.sleep(60)
+            try:
+                _state_cache.sweep()
+                now = datetime.now()
+                for key, (seen, _) in list(_compound_cache.items()):
+                    if now - seen >= CACHE_TTL:
+                        _compound_cache.pop(key, None)
+                try:
+                    pubchem_client._cache.sweep()
+                except NameError:
+                    pass
+                import chemistry_ui
+                chemistry_ui.sweep_inactive_settings()
+                import publication_entry_advanced
+                publication_entry_advanced.sweep_old_reactions()
+            except Exception:
+                orca_logger.exception("Transient in-memory cleanup failed")
+
+    asyncio.run_coroutine_threadsafe(_periodic_cleanup(), loop)
     return loop
 
 
@@ -1253,7 +1278,7 @@ async def _dispatch_update(bot: TelegramAPI, raw_update: dict[str, Any]):
     try:
         update = UpdateProxy(bot, raw_update)
     except Exception as e:
-        orca_logger.error(f'فشل تفسير التحديث الوارد من Telegram: {e}\nRaw update: {raw_update}')
+        orca_logger.error('Invalid Telegram update: %s', e)
         return
 
     chat_id = update.effective_chat.id if update.effective_chat else None
@@ -1399,7 +1424,8 @@ def run_orca_flask_server():
         f'{"?secret=<ORCA_WEBHOOK_SECRET>" if ORCA_WEBHOOK_SECRET else ""} '
         'لتسجيل الـ Webhook لدى Telegram (بوت ORCA فقط).'
     )
-    app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
+    from waitress import serve
+    serve(app, host='0.0.0.0', port=port, threads=4, connection_limit=32, channel_timeout=30)
 
 # ══════════════════════════════════════════════════════════════════════════
 # ██  القسم الثاني: بوت الكيمياء - Chemistry Drawing Bot (Polling)  ██
@@ -1416,8 +1442,8 @@ ADMIN_ID: int = int(os.environ.get("ADMIN_ID", "7495822836"))
 PUBCHEM_BASE_URL = "https://pubchem.ncbi.nlm.nih.gov/rest/pug"
 CIR_BASE_URL = "https://cactus.nci.nih.gov/chemical/structure"
 PUBCHEM_TIMEOUT_SECONDS = 10.0
-PUBCHEM_MAX_CONCURRENT_REQUESTS = 4
-PUBCHEM_CACHE_MAX_ENTRIES = 512
+PUBCHEM_MAX_CONCURRENT_REQUESTS = 2
+PUBCHEM_CACHE_MAX_ENTRIES = 64
 
 MOL_IMAGE_SIZE = (560, 420)
 REACTION_SUBIMAGE_SIZE = (420, 340)
@@ -1631,19 +1657,36 @@ def safe_filename(name: str) -> str:
 class _LRUCache:
     def __init__(self, max_entries: int) -> None:
         self._max_entries = max_entries
+        self._timestamps = {}
+        self._ttl = 30 * 60
         self._data: "OrderedDict[str, Optional[str]]" = OrderedDict()
 
     def get(self, key: str) -> Optional[str]:
         if key not in self._data:
             return None
+        if time.monotonic() - self._timestamps.get(key, 0) > self._ttl:
+            self._data.pop(key, None)
+            self._timestamps.pop(key, None)
+            return None
         self._data.move_to_end(key)
+        self._timestamps[key] = time.monotonic()
         return self._data[key]
+
+    def sweep(self) -> int:
+        now = time.monotonic()
+        expired = [k for k, ts in self._timestamps.items() if now - ts >= self._ttl]
+        for k in expired:
+            self._timestamps.pop(k, None)
+            self._data.pop(k, None)
+        return len(expired)
 
     def set(self, key: str, value: Optional[str]) -> None:
         self._data[key] = value
+        self._timestamps[key] = time.monotonic()
         self._data.move_to_end(key)
         if len(self._data) > self._max_entries:
-            self._data.popitem(last=False)
+            k, _ = self._data.popitem(last=False)
+            self._timestamps.pop(k, None)
 
 
 class PubChemClient:

@@ -5,7 +5,7 @@ per user forever, so memory grew with every new chat until the service was
 restarted. This store keeps the same mapping API the bot already uses
 (``get`` / ``[]=`` / ``pop`` / ``in``) but:
 
-* drops sessions that were not written for ``ttl_seconds`` (default 6 hours), and
+* drops sessions that were not written for ``ttl_seconds`` (default 30 minutes), and
 * keeps at most ``max_items`` sessions, evicting the least recently written one.
 
 Both limits can be overridden with the ``STATE_CACHE_MAX_ITEMS`` and
@@ -20,8 +20,8 @@ from collections import OrderedDict
 from collections.abc import MutableMapping
 from typing import Any, Callable, Iterator
 
-DEFAULT_MAX_ITEMS = 500
-DEFAULT_TTL_SECONDS = 6 * 60 * 60
+DEFAULT_MAX_ITEMS = 128
+DEFAULT_TTL_SECONDS = 30 * 60
 
 
 def _env_number(name: str, default, cast):
@@ -95,3 +95,10 @@ class BoundedStateCache(MutableMapping):
     def clear(self) -> None:
         with self._lock:
             self._data.clear()
+
+    def sweep(self) -> int:
+        """Actively erase expired session values, even without new bot messages."""
+        with self._lock:
+            before = len(self._data)
+            self._purge_expired(self._clock())
+            return before - len(self._data)

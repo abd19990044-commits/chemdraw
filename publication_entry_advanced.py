@@ -9,6 +9,7 @@ pipeline on top of the interactive chemistry bot. ORCA/Flask remains untouched.
 
 import asyncio
 import html
+import time
 
 from telegram import Update
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, MessageHandler, filters
@@ -22,6 +23,17 @@ from single_compound_pipeline import install_single_compound_pipeline
 
 
 _LAST_REACTION: dict[int, dict] = {}
+_LAST_REACTION_TIME: dict[int, float] = {}
+
+
+def sweep_old_reactions() -> int:
+    now = time.monotonic()
+    expired = [uid for uid, seen in _LAST_REACTION_TIME.items() if now - seen >= 1800]
+    for uid in expired:
+        _LAST_REACTION.pop(uid, None)
+        _LAST_REACTION_TIME.pop(uid, None)
+    return len(expired)
+
 
 
 def _format_redox_with_names(result: adv.RedoxResult, reactant_terms, product_terms) -> str:
@@ -54,6 +66,8 @@ def install_publication_renderer(app_module) -> None:
 
     def cache_final_reaction(user_id, reactant_terms, product_terms, reactant_pairs, product_pairs, equation) -> None:
         uid = int(user_id or 0)
+        sweep_old_reactions()
+        _LAST_REACTION_TIME[uid] = time.monotonic()
         _LAST_REACTION[uid] = {
             "reactant_terms": list(reactant_terms),
             "product_terms": list(product_terms),
@@ -82,7 +96,10 @@ def install_publication_renderer(app_module) -> None:
             return True
         if action not in {"redox_acidic", "redox_basic", "net_ionic", "atom_map"}:
             return False
+        sweep_old_reactions()
         cached = _LAST_REACTION.get(int(user_id))
+        if cached:
+            _LAST_REACTION_TIME[int(user_id)] = time.monotonic()
         if not cached:
             await query.message.reply_text("⚠️ Draw a reaction first, then use the Advanced Chemistry tools on that reaction.")
             return True

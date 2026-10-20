@@ -3,3 +3,5 @@ httpx==0.28.1
 python-telegram-bot==22.8
 rdkit==2026.3.6
 Pillow==12.1.1
+
+waitress>=3.0,<4

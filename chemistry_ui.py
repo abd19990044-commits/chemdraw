@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Dict
+import time
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
@@ -25,12 +26,27 @@ class ChemUserSettings:
 
 
 _SETTINGS: Dict[int, ChemUserSettings] = {}
+_LAST_USED: Dict[int, float] = {}
+_IDLE_SECONDS = 1800
+
+
+def sweep_inactive_settings() -> int:
+    now = time.monotonic()
+    expired = [uid for uid, seen in _LAST_USED.items() if now - seen >= _IDLE_SECONDS]
+    for uid in expired:
+        _LAST_USED.pop(uid, None)
+        _SETTINGS.pop(uid, None)
+    return len(expired)
+
 
 
 def get_settings(user_id: int | None) -> ChemUserSettings:
     if user_id is None:
         return ChemUserSettings()
-    return _SETTINGS.setdefault(int(user_id), ChemUserSettings())
+    sweep_inactive_settings()
+    uid = int(user_id)
+    _LAST_USED[uid] = time.monotonic()
+    return _SETTINGS.setdefault(uid, ChemUserSettings())
 
 
 def _mark(v: bool) -> str:

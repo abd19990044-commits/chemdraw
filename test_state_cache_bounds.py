@@ -70,5 +70,14 @@ def test_orca_bot_uses_the_bounded_store():
     import legacy_app
 
     assert isinstance(legacy_app._state_cache, BoundedStateCache)
-    assert legacy_app._state_cache.max_items == 500
-    assert legacy_app._state_cache.ttl_seconds == 6 * 60 * 60
+    assert legacy_app._state_cache.max_items == 128
+    assert legacy_app._state_cache.ttl_seconds == 30 * 60
+
+
+def test_periodic_sweep_removes_expired_data():
+    clock = FakeClock()
+    cache = BoundedStateCache(max_items=5, ttl_seconds=1800, clock=clock)
+    cache["u"] = {"coords": "H 0 0 0"}
+    clock.now += 1801
+    assert cache.sweep() == 1
+    assert len(cache) == 0

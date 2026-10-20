@@ -12,9 +12,9 @@ from typing import Any, Callable, Hashable
 # serialized by default. Extra requests wait in a bounded request queue instead
 # of starting more RDKit/Pillow jobs in parallel.
 _WORKERS = max(1, int(os.getenv("CHEM_RENDER_WORKERS", "1")))
-_MAX_PENDING = max(_WORKERS, int(os.getenv("CHEM_MAX_PENDING", "48")))
-_CACHE_MAX_BYTES = max(0, int(os.getenv("CHEM_RENDER_CACHE_MB", "12"))) * 1024 * 1024
-_CACHE_MAX_ITEMS = max(0, int(os.getenv("CHEM_RENDER_CACHE_ITEMS", "48")))
+_MAX_PENDING = max(_WORKERS, int(os.getenv("CHEM_MAX_PENDING", "8")))
+_CACHE_MAX_BYTES = max(0, int(os.getenv("CHEM_RENDER_CACHE_MB", "0"))) * 1024 * 1024
+_CACHE_MAX_ITEMS = max(0, int(os.getenv("CHEM_RENDER_CACHE_ITEMS", "0")))
 
 _executor = ThreadPoolExecutor(max_workers=_WORKERS, thread_name_prefix="chem-render")
 _pending_lock = threading.Lock()
