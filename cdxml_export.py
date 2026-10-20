@@ -104,7 +104,7 @@ def _add_text(page: ET.Element, obj_id: int, x: float, y: float, text: str, size
     t = ET.SubElement(page, "t", {"id": str(obj_id), "p": f"{x:.2f} {y:.2f}", "Justification": "Center"})
     for chunk, sup in _text_runs(text):
         s_attrs = {"font": str(FONT_ID), "size": f"{float(size):g}"}
-        face = (1 if bold else 0) | (32 if sup else 0)
+        face = (1 if bold else 0) | (64 if sup else 0)
         if face:
             s_attrs["face"] = str(face)
         s = ET.SubElement(t, "s", s_attrs)
@@ -137,7 +137,7 @@ def _add_fragment(page: ET.Element, obj_id: int, mol: Chem.Mol, x0: float, cente
             attrs["Isotope"] = str(isotope)
         amap = atom.GetAtomMapNum()
         if amap:
-            attrs["AtomMap"] = str(amap)
+            # Reaction atom mappings belong to reaction-step metadata, not node AtomMap.
         ET.SubElement(frag, "n", attrs)
         atom_ids[i] = obj_id
         obj_id += 1
