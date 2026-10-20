@@ -247,6 +247,55 @@ def install_quantum_input_extension(core) -> None:
         )
         ud.clear()
 
+    async def handle_name(update, context):
+        """Load the molecule without letting an optional preview block the wizard.
+
+        PubChem pictures and its HTML property summary are optional.  Telegram
+        may reject malformed HTML or a large image; the engine chooser must
+        still be sent so the user can generate a real calculation input.
+        """
+        name = (update.message.text or "")[1:].strip()
+        if not name:
+            await update.message.reply_text("Send a compound after #, e.g. #benzene.")
+            return
+        context.user_data.clear()
+        progress = await update.message.reply_text("⏳ Loading coordinates for " + name[:100] + "...")
+        try:
+            coords, image, properties, error = await core.fetch_compound_async(name)
+        except Exception:
+            core.orca_logger.exception("Compound lookup failed")
+            await progress.edit_text("❌ Compound lookup failed. Please retry or upload an XYZ/MOL/SDF file.")
+            return
+        if not coords:
+            await progress.edit_text("❌ " + str(error or "No 3D coordinates were found.")[:500])
+            return
+
+        # Store the geometry before any network-dependent Telegram sends.
+        context.user_data.update(
+            coords=normalize_geometry_xyz(coords),
+            name=core.sanitize_filename(name),
+            state="waiting_for_engine",
+        )
+        try:
+            await progress.delete()
+        except Exception:
+            pass
+        if image:
+            try:
+                await update.message.reply_photo(photo=image)
+            except Exception:
+                core.orca_logger.warning("Molecule preview was rejected; continuing with engine menu", exc_info=True)
+        if properties:
+            try:
+                await update.message.reply_text(properties, parse_mode="HTML")
+            except Exception:
+                core.orca_logger.warning("Compound property HTML rejected; continuing with engine menu", exc_info=True)
+        # This essential message is not subordinate to successful image/HTML delivery.
+        await update.message.reply_text(
+            "✅ Geometry loaded. Select the quantum-chemistry engine to produce an input file:",
+            reply_markup=_engine_markup(core),
+        )
+
     async def handle_file(update, context):
         document = update.message.document
         filename = document.file_name or "input"
@@ -560,6 +609,7 @@ def install_quantum_input_extension(core) -> None:
             )
 
     core.start_command = start_command
+    core.handle_name = handle_name
     core.handle_file = handle_file
     core.callback_handler = callback_handler
     core.handle_text_input = handle_text_input
