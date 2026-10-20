@@ -138,13 +138,15 @@ def _cache_get(key: str):
     if key in _compound_cache:
         ts, value = _compound_cache[key]
         if datetime.now() - ts < CACHE_TTL:
-            orca_logger.info(f'Cache HIT: {key}')
+            _compound_cache[key] = (datetime.now(), value)
             return value
         del _compound_cache[key]
     return None
 
 
 def _cache_set(key: str, value: tuple):
+    if CACHE_MAX_ITEMS <= 0:
+        return
     if len(_compound_cache) >= CACHE_MAX_ITEMS:
         oldest_key = min(_compound_cache, key=lambda k: _compound_cache[k][0])
         del _compound_cache[oldest_key]
