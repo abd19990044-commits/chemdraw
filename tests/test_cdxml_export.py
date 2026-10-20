@@ -64,12 +64,12 @@ def test_cdxml_smart_mode_matches_condensed_small_species():
     assert data is not None
     root = ET.fromstring(data)
     text = " ".join("".join(t.itertext()) for t in root.findall("page/t"))
-    assert "CH₂" in text
-    assert "H₂" in text
-    assert "CH₃" in text
-    assert len(root.findall("page/fragment")) == 0
-    plain_lines = [g for g in root.findall("page/graphic") if not g.get("ArrowType")]
-    assert len(plain_lines) >= 3
+    # Smart image previews may be condensed; downloadable CDXML must remain
+    # a true editable molecule graph (not just text plus graphic lines).
+    fragments = root.findall("page/fragment")
+    assert len(fragments) == 3
+    assert sum(len(f.findall("n")) for f in fragments) >= 6
+    assert all(not any(g.get("GraphicType") == "Line" and not g.get("ArrowType") for g in root.findall("page/graphic")) for _ in [0])
 
 
 def test_cdxml_equilibrium_arrow():
