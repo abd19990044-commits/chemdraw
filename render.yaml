@@ -7,6 +7,8 @@ services:
     plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: python app.py
+    # Single process, bounded worker/thread pools, volatile RAM-only state.
+    # The hosting plan determines whether service sleeps when idle.
     healthCheckPath: /health
     envVars:
       - key: ORCA_BOT_TOKEN
