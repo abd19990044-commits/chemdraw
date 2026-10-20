@@ -135,9 +135,7 @@ def _add_fragment(page: ET.Element, obj_id: int, mol: Chem.Mol, x0: float, cente
         isotope = atom.GetIsotope()
         if isotope:
             attrs["Isotope"] = str(isotope)
-        amap = atom.GetAtomMapNum()
-        if amap:
-            # Reaction atom mappings belong to reaction-step metadata, not node AtomMap.
+        # Atom mapping is not represented by a node AtomMap attribute.
         ET.SubElement(frag, "n", attrs)
         atom_ids[i] = obj_id
         obj_id += 1
