@@ -234,6 +234,28 @@ def _start_background_loop() -> asyncio.AbstractEventLoop:
 
     t = threading.Thread(target=_runner, name='bot-event-loop', daemon=True)
     t.start()
+
+    async def _periodic_cleanup():
+        while True:
+            await asyncio.sleep(60)
+            try:
+                _state_cache.sweep()
+                now = datetime.now()
+                for key, (seen, _) in list(_compound_cache.items()):
+                    if now - seen >= CACHE_TTL:
+                        _compound_cache.pop(key, None)
+                try:
+                    pubchem_client._cache.sweep()
+                except NameError:
+                    pass
+                import chemistry_ui
+                chemistry_ui.sweep_inactive_settings()
+                import publication_entry_advanced
+                publication_entry_advanced.sweep_old_reactions()
+            except Exception:
+                orca_logger.exception("Transient in-memory cleanup failed")
+
+    asyncio.run_coroutine_threadsafe(_periodic_cleanup(), loop)
     return loop
 
 
@@ -1644,6 +1666,14 @@ class _LRUCache:
             return None
         self._data.move_to_end(key)\n        self._timestamps[key] = time.monotonic()
         return self._data[key]
+
+    def sweep(self) -> int:
+        now = time.monotonic()
+        expired = [k for k, ts in self._timestamps.items() if now - ts >= self._ttl]
+        for k in expired:
+            self._timestamps.pop(k, None)
+            self._data.pop(k, None)
+        return len(expired)
 
     def set(self, key: str, value: Optional[str]) -> None:
         self._data[key] = value\n        self._timestamps[key] = time.monotonic()\n        self._data.move_to_end(key)
