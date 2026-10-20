@@ -9,6 +9,8 @@ import re
 import weakref
 
 import gaussian_input as g16
+import gaussian_catalog as gcat
+import gaussian_advanced as gadv
 from gaussview_linux import convert_gaussview_to_linux, decode_gaussview_text
 import psi4_extension as psi4_ui
 from geometry_normalizer import normalize_geometry_xyz
@@ -439,6 +441,26 @@ def install_quantum_input_extension(core) -> None:
                 reply_markup=core.build_markup(g16.TASKS, "g_task", 2),
             )
             return
+        if data.startswith("gcat_"):
+            await query.answer()
+            if not ud.get("coords") or ud.get("engine") != "gaussian":
+                await query.edit_message_text("Gaussian session expired. Send /start.")
+                return
+            try:
+                await _gaussian_catalog_callback(core, query, ud, data)
+            except ValueError as exc:
+                await query.edit_message_text(f"❌ {exc} Choose a fresh Gaussian workflow.")
+            return
+        if data.startswith("gadv_"):
+            await query.answer()
+            if not ud.get("coords") or ud.get("engine") != "gaussian":
+                await query.edit_message_text("Gaussian session expired. Send /start.")
+                return
+            try:
+                await _gaussian_advanced_callback(core, query, ud, data)
+            except ValueError as exc:
+                await query.edit_message_text(f"❌ {exc} Start a new Gaussian workflow.")
+            return
         if data.startswith("g_"):
             await query.answer()
             if not ud.get("coords") or ud.get("engine") != "gaussian":
@@ -609,6 +631,35 @@ def install_quantum_input_extension(core) -> None:
                 update.message, ud, update.message.text or "", state.split("_")[1]
             )
             return
+        if state.startswith("g_custom_"):
+            kind = state[len("g_custom_"):]
+            try:
+                keyword = gcat.custom_keyword(text, kind)
+            except ValueError as exc:
+                await update.message.reply_text(f"❌ {exc} Try again or /cancel.")
+                return
+            if kind == "method":
+                ud["gauss_method"] = keyword
+                ud["gauss_custom_method"] = keyword
+                ud["state"] = "g_basis"
+                await update.message.reply_text(
+                    "Gaussian — choose orbital basis family:",
+                    reply_markup=core.build_markup(
+                        {"Common basis sets": "quick", "Browse basis families": "family", "Custom basis keyword": "custom"},
+                        "gcat_basis", 1))
+            else:
+                ud["gauss_basis"] = keyword
+                ud["gauss_custom_basis"] = keyword
+                if ud.get("gauss_method") in {"B3LYP", "PBE1PBE"}:
+                    ud["state"] = "g_disp"
+                    await update.message.reply_text("Gaussian — dispersion:",
+                        reply_markup=core.build_markup(g16.DISPERSION, "g_disp"))
+                else:
+                    ud["gauss_dispersion"] = "none"
+                    ud["state"] = "g_solv"
+                    await update.message.reply_text("Gaussian — solvation:",
+                        reply_markup=core.build_markup(g16.SOLVATION, "g_solv"))
+            return
         if state.startswith("g_"):
             await _gaussian_text(update.message, ud, text)
             return
@@ -642,12 +693,14 @@ async def _gaussian_callback(core, query, ud, data):
         ud["gauss_task"] = value if value in choices.values() else _invalid()
         ud["state"] = "g_method"
         methods = {
-            label: method
-            for label, method in g16.METHODS.items()
+            label: method for label, method in g16.METHODS.items()
             if value in g16.allowed_tasks(method).values()
         }
         await query.edit_message_text(
-            "Gaussian — method:", reply_markup=core.build_markup(methods, "g_method", 2)
+            "Gaussian — choose method family or use the common-method menu:",
+            reply_markup=core.build_markup(
+                {"Common methods": "quick", "Browse all families": "family", "Custom Gaussian keyword (SP only)": "custom"},
+                "gcat_method", 1),
         )
     elif field == "method":
         if (
@@ -656,11 +709,7 @@ async def _gaussian_callback(core, query, ud, data):
         ):
             _invalid()
         ud["gauss_method"] = value
-        ud["state"] = "g_basis"
-        await query.edit_message_text(
-            "Gaussian — orbital basis:",
-            reply_markup=core.build_markup(g16.BASIS, "g_basis", 2),
-        )
+        await _ask_gaussian_basis_catalog(core, query, ud)
     elif field == "basis":
         if value not in g16.BASIS.values():
             _invalid()
@@ -702,9 +751,167 @@ async def _gaussian_callback(core, query, ud, data):
         if value not in g16.ACCURACY.values():
             _invalid()
         ud["gauss_accuracy"] = value
-        ud["state"] = "g_charge"
-        await query.edit_message_text("Gaussian — enter molecular charge (e.g. 0):")
+        ud["state"] = "g_adv_gate"
+        await query.edit_message_text(
+            "Gaussian — advanced numerical settings:",
+            reply_markup=core.build_markup(
+                {"Recommended defaults": "defaults", "Configure advanced options": "configure"}, "gadv_gate", 1),
+        )
 
+
+async def _ask_gaussian_basis_catalog(core, query, ud):
+    ud["state"] = "g_basis"
+    await query.edit_message_text(
+        "Gaussian — choose basis family:",
+        reply_markup=core.build_markup(
+            {"Common basis sets": "quick", "Browse basis families": "family", "Custom Gaussian basis keyword": "custom"},
+            "gcat_basis", 1),
+    )
+
+
+async def _gaussian_catalog_callback(core, query, ud, data):
+    # gcat_method_quick, gcat_method_family, gcat_mfam_0,
+    # gcat_mpage_1, gcat_mpick_2 and corresponding basis selectors.
+    parts = data.split("_")
+    if len(parts) < 3:
+        raise ValueError("Invalid Gaussian catalogue selection.")
+    group, action = parts[1], parts[2]
+    kind = "method" if group in {"method", "mfam", "mpage", "mpick"} else "basis"
+    families = gcat.METHOD_FAMILIES if kind == "method" else gcat.BASIS_FAMILIES
+    field = "g_method" if kind == "method" else "g_basis"
+    if kind == "method" and ud.get("state") != "g_method":
+        raise ValueError("Method selector is not active.")
+    if kind == "basis" and ud.get("state") != "g_basis":
+        raise ValueError("Basis selector is not active.")
+
+    if group in {"method", "basis"}:
+        if action == "custom":
+            if kind == "method" and ud.get("gauss_task") != "sp":
+                raise ValueError("Custom method choices are limited to single-point; use /manual for derivatives.")
+            ud["state"] = "g_custom_" + kind
+            await query.edit_message_text(
+                "Enter one Gaussian 16 " + kind + " route keyword (not Gen/GenECP). "
+                "No spaces, slash, or extra input sections; /cancel aborts.")
+            return
+        if action == "family":
+            await query.edit_message_text(
+                "Gaussian — select " + kind + " family:",
+                reply_markup=core.build_markup(gcat.family_options(families), "gcat_" + ("mfam" if kind == "method" else "bfam"), 1))
+            return
+        if action == "quick":
+            common = (
+                {"B3LYP": "B3LYP", "PBE0": "PBE1PBE", "CAM-B3LYP": "CAM-B3LYP", "M06-2X": "M062X",
+                 "wB97X-D": "wB97XD", "HF": "HF", "MP2": "MP2", "CCSD(T)": "CCSD(T)"}
+                if kind == "method" else
+                {"6-31G(d)": "6-31G(d)", "6-31+G(d,p)": "6-31+G(d,p)",
+                 "def2-SVP": "Def2SVP", "def2-TZVP": "Def2TZVP",
+                 "def2-QZVP": "Def2QZVP", "cc-pVDZ": "cc-pVDZ", "aug-cc-pVDZ": "aug-cc-pVDZ"}
+            )
+            if kind == "method":
+                common = {k: v for k, v in common.items() if ud.get("gauss_task") in g16.allowed_tasks(v).values()}
+            ud["g_catalog_choices"] = list(common.values())
+            await query.edit_message_text("Gaussian — common " + kind + " options:",
+                reply_markup=core.build_markup({k: str(i) for i, k in enumerate(common)}, "gcat_" + ("mpick" if kind == "method" else "bpick"), 2))
+            return
+        raise ValueError("Invalid catalogue action.")
+    if group in {"mfam", "bfam"}:
+        i = bounded_int(action, "Family index", 0, len(families) - 1)
+        ud["g_catalog_family"] = i
+        ud["g_catalog_kind"] = kind
+        await _show_catalog_page(core, query, ud, kind, 0)
+        return
+    if group in {"mpage", "bpage"}:
+        await _show_catalog_page(core, query, ud, kind, bounded_int(action, "Page index", 0, 50))
+        return
+    if group in {"mpick", "bpick"}:
+        choices = ud.get("g_catalog_choices", [])
+        i = bounded_int(action, "Selection", 0, len(choices)-1)
+        value = choices[i]
+        if kind == "method":
+            if ud.get("gauss_task") not in g16.allowed_tasks(value).values():
+                raise ValueError("Selected method does not support this guided calculation task.")
+            ud["gauss_method"] = value
+            await _ask_gaussian_basis_catalog(core, query, ud)
+        else:
+            ud["gauss_basis"] = value
+            await _after_gaussian_basis(core, query, ud)
+        return
+    raise ValueError("Unsupported Gaussian catalogue button.")
+
+
+async def _show_catalog_page(core, query, ud, kind, page):
+    families = gcat.METHOD_FAMILIES if kind == "method" else gcat.BASIS_FAMILIES
+    family_idx = ud.get("g_catalog_family", -1)
+    if ud.get("g_catalog_kind") != kind or family_idx not in range(len(families)):
+        raise ValueError("Select a Gaussian catalogue family first.")
+    label = list(families)[family_idx]
+    options = families[label]
+    if kind == "method":
+        options = {k:v for k,v in options.items() if ud.get("gauss_task") in g16.allowed_tasks(v).values()}
+    page_options, total = gcat.paginate(options, page)
+    values = list(page_options.values())
+    ud["g_catalog_choices"] = values
+    prefix = "gcat_mpick" if kind == "method" else "gcat_bpick"
+    buttons = {k: str(i) for i,k in enumerate(page_options)}
+    if page > 0:
+        buttons["⬅ Previous page"] = "__back__"
+    if page+1 < total:
+        buttons["Next page ➡"] = "__next__"
+    # Navigation has distinct button prefixes; don't encode navigation as a pick.
+    markup = core.build_markup({k: v for k,v in buttons.items() if not v.startswith("__")}, prefix, 2)
+    if page > 0:
+        markup["inline_keyboard"].insert(-1, [{"text":"⬅ Previous page", "callback_data": f"gcat_{'mpage' if kind=='method' else 'bpage'}_{page-1}"}])
+    if page + 1 < total:
+        markup["inline_keyboard"].insert(-1, [{"text":"Next page ➡", "callback_data": f"gcat_{'mpage' if kind=='method' else 'bpage'}_{page+1}"}])
+    await query.edit_message_text(f"Gaussian — {label} ({page+1}/{total})", reply_markup=markup)
+
+
+async def _after_gaussian_basis(core, query, ud):
+    if ud["gauss_method"] in {"B3LYP", "PBE1PBE"}:
+        ud["state"] = "g_disp"
+        await query.edit_message_text("Gaussian — empirical dispersion:",
+            reply_markup=core.build_markup(g16.DISPERSION, "g_disp"))
+    else:
+        ud["gauss_dispersion"] = "none"
+        await _ask_solvation(core, query, ud)
+
+
+async def _gaussian_advanced_callback(core, query, ud, data):
+    parts = data.split("_", 2)
+    if len(parts) != 3:
+        raise ValueError("Invalid advanced Gaussian button.")
+    _, field, value = parts
+    if field == "gate":
+        if ud.get("state") != "g_adv_gate" or value not in {"defaults", "configure"}:
+            raise ValueError("Stale Gaussian advanced button.")
+        if value == "defaults":
+            ud["state"] = "g_charge"
+            await query.edit_message_text("Gaussian — enter molecular charge (e.g. 0):")
+        else:
+            ud["g_advanced_fields"] = gadv.active_fields(ud)
+            ud["g_advanced_index"] = 0
+            await _show_gaussian_advanced_option(core, query, ud)
+        return
+    names = ud.get("g_advanced_fields", [])
+    idx = ud.get("g_advanced_index", 0)
+    if not names or idx >= len(names) or names[idx] != field or ud.get("state") != "g_advanced":
+        raise ValueError("Stale Gaussian advanced option.")
+    if value not in gadv.options_for(ud, field).values():
+        raise ValueError("Unsupported Gaussian advanced choice.")
+    ud["gauss_" + field] = value
+    ud["g_advanced_index"] = idx + 1
+    if ud["g_advanced_index"] >= len(names):
+        ud["state"] = "g_charge"
+        await query.edit_message_text("Gaussian settings saved. Enter molecular charge (e.g. 0):")
+    else:
+        await _show_gaussian_advanced_option(core, query, ud)
+
+
+async def _show_gaussian_advanced_option(core, query, ud):
+    ud["state"] = "g_advanced"
+    field = ud["g_advanced_fields"][ud["g_advanced_index"]]
+    options, prompt = gadv.FIELD_OPTIONS[field]
+    await query.edit_message_text(prompt, reply_markup=core.build_markup(gadv.options_for(ud, field), "gadv_" + field, 1))
 
 def _invalid():
     raise ValueError("Unsupported selection.")

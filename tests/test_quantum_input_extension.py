@@ -212,6 +212,7 @@ def test_gaussian_wizard_from_geometry_to_download():
             "g_solv_SMD",
             "g_solvent_Water",
             "g_accuracy_tight",
+            "gadv_gate_defaults",
         ):
             q = Query(button)
             await core.callback_handler(SimpleNamespace(callback_query=q), ctx)
@@ -415,3 +416,59 @@ def test_compound_lookup_preview_failure_still_shows_engine_menu(monkeypatch):
         for button in row
     }
     assert {"engine_orca", "engine_psi4", "engine_gaussian"} <= callback_values
+
+
+class ExtendedQuery:
+    def __init__(self,data):
+        self.data=data
+        self.answers=0
+        self.edits=[]
+    async def answer(self):
+        self.answers+=1
+    async def edit_message_text(self,text,**kw):
+        self.edits.append((text,kw))
+
+class ExtendedMessage:
+    def __init__(self,text):
+        self.text=text
+        self.replies=[]
+        self.docs=[]
+    async def reply_text(self,text,**kw):
+        self.replies.append((text,kw))
+    async def reply_document(self,document,caption):
+        self.docs.append((document.name,document.getvalue().decode(),caption))
+
+def test_telegram_method_and_basis_catalog_to_output():
+    import app
+    core=app.core
+    state={"coords":WATER,"name":"water","state":"waiting_for_engine"}
+    ctx=SimpleNamespace(user_data=state)
+    async def click(data):
+        q=ExtendedQuery(data)
+        await core.callback_handler(SimpleNamespace(callback_query=q),ctx)
+        assert q.answers==1 and q.edits, data
+        return q.edits[-1]
+    async def run():
+        await click("engine_gaussian")
+        await click("quantum_guided_gaussian")
+        await click("g_task_sp")
+        await click("gcat_method_family")
+        await click("gcat_mfam_2")
+        await click("gcat_mpick_1")  # PBE0 from hybrid family
+        assert state["gauss_method"]=="PBE1PBE"
+        await click("gcat_basis_family")
+        await click("gcat_bfam_3")
+        await click("gcat_bpick_5")  # def2-QZVP
+        assert state["gauss_basis"]=="Def2QZVP"
+        await click("g_disp_none")
+        await click("g_solv_none")
+        await click("g_accuracy_standard")
+        await click("gadv_gate_defaults")
+        for value in ("0","1","4","4000","5000"):
+            m=ExtendedMessage(value)
+            await core.handle_text_input(SimpleNamespace(message=m),ctx)
+        return m
+    m=asyncio.run(run())
+    assert m.docs
+    assert "PBE1PBE/Def2QZVP" in m.docs[0][1]
+    assert state=={}
