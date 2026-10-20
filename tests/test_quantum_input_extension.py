@@ -371,3 +371,47 @@ def test_existing_webhook_stays_available_without_configured_secret(monkeypatch)
     assert client.post("/telegram", json=payload).status_code == 200
     assert sent and "Gaussian 16" in sent[0][1]
     assert client.get("/registerWebhook").status_code == 403
+
+
+def test_compound_lookup_preview_failure_still_shows_engine_menu(monkeypatch):
+    import app
+
+    core = app.core
+    water = WATER
+    async def lookup(name):
+        return water, b"bad preview", "<bad html>", None
+
+    monkeypatch.setattr(core, "fetch_compound_async", lookup)
+    ctx = SimpleNamespace(user_data={})
+    events = []
+
+    class Progress:
+        async def delete(self):
+            events.append("deleted")
+
+    class BrokenPreviewMessage:
+        text = "#water"
+
+        async def reply_text(self, value, **kwargs):
+            if kwargs.get("parse_mode") == "HTML":
+                raise RuntimeError("Telegram rejected HTML")
+            events.append(("text", value, kwargs))
+            return Progress()
+
+        async def reply_photo(self, **kwargs):
+            raise RuntimeError("Telegram rejected photo")
+
+    async def run():
+        await core.handle_name(SimpleNamespace(message=BrokenPreviewMessage()), ctx)
+
+    asyncio.run(run())
+    assert ctx.user_data["coords"] == water
+    assert ctx.user_data["state"] == "waiting_for_engine"
+    last = events[-1]
+    assert last[0] == "text"
+    callback_values = {
+        button["callback_data"]
+        for row in last[2]["reply_markup"]["inline_keyboard"]
+        for button in row
+    }
+    assert {"engine_orca", "engine_psi4", "engine_gaussian"} <= callback_values
