@@ -13,6 +13,7 @@ from geometry_normalizer import install_geometry_normalizer
 from publication_entry_advanced import install_publication_renderer
 from psi4_extension_v4 import install_psi4_extension_v4
 from quantum_input_extension import install_quantum_input_extension
+from quantum_batch import install_quantum_batch
 
 # Geometry normalization is installed before the quantum-input wizard so every
 # PubChem, MOL/SDF and XYZ path is canonicalized to Element/X/Y/Z coordinates
@@ -21,6 +22,7 @@ install_geometry_normalizer(core)
 install_publication_renderer(core)
 install_psi4_extension_v4(core)
 install_quantum_input_extension(core)
+install_quantum_batch(core)
 
 # Re-export the Flask application for platforms/tools that import ``app:app``.
 app = core.app
