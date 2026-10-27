@@ -66,7 +66,7 @@ def test_reject_unknown_output_and_binary():
     with pytest.raises(ValueError, match="No supported Cartesian"):
         extract_final_geometry("No structure found\n")
     with pytest.raises(ValueError, match="Binary"):
-        read_structure(b"xyz\\x00", ".log")
+        read_structure(b"xyz" + bytes([0]), ".log")
 
 
 def _settings(engine):
@@ -104,7 +104,7 @@ def test_batch_generates_individual_named_documents(engine, suffix):
     assert len(files) == 20
     assert files[0][0] == "01_water_0" + suffix
     assert files[19][0] == "20_water_19" + suffix
-    assert all(b"PK\\x03\\x04" not in data for _, data in files)
+    assert all(bytes([80, 75, 3, 4]) not in data for _, data in files)
     assert len({name for name, _ in files}) == 20
 
 
