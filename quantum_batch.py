@@ -264,15 +264,10 @@ def install_quantum_batch(core) -> None:
         )
 
     async def start_command(update, context):
+        # Preserve the pre-existing single /start welcome response, on which
+        # both webhook clients and the public regression suite rely.  The
+        # batch instructions are part of quantum_input_extension.WELCOME.
         await old_start(update, context)
-        await update.message.reply_text(
-            "Upload Gaussian .log or ORCA/Psi4 .out to extract the last printed "
-            "geometry (and download XYZ), then choose a calculation engine.\n"
-            "For up to 20 structures: /batch → upload XYZ/MOL/SDF/LOG/OUT "
-            "files → /done → select one engine and settings → "
-            "receive up to 20 separate input documents.\n"
-            "/batch_status checks the count; /cancel clears the batch."
-        )
 
     async def handle_file(update, context):
         doc = update.message.document
