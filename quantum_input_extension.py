@@ -30,6 +30,10 @@ WELCOME = (
     "Then select an engine and follow the buttons.\n\n"
     "For complete expert inputs, send /manual and paste the Gaussian or Psi4 file, "
     "or upload a GaussView .gjf/.com or Psi4 .dat file. The bot prepares files; it never runs calculations.\n"
+    "For output geometries upload Gaussian .log or ORCA/Psi4 .out. "
+    "For batches: /batch, upload up to 20 coordinate/output files, then /done; "
+    "the bot sends separate input documents, not ZIP. "
+    "Use /batch_status to see progress and /retry_batch after interrupted delivery.\n"
     "Use /cancel to restart at any time. Gaussian guided jobs limit MaxDisk to 20000 MB."
 )
 
